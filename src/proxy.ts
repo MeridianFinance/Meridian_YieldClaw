@@ -1139,9 +1139,18 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     }
 
     // Verify the existing proxy is using the same payment chain
-    if (existingProxy.paymentChain && existingProxy.paymentChain !== paymentChain) {
+    if (existingProxy.paymentChain) {
+      if (existingProxy.paymentChain !== paymentChain) {
+        throw new Error(
+          `Existing proxy on port ${listenPort} is using ${existingProxy.paymentChain} but ${paymentChain} was requested. ` +
+          `Stop the existing proxy first or use a different port.`,
+        );
+      }
+    } else if (paymentChain !== "base") {
+      // Old proxy doesn't report chain — assume Base. Reject if Solana was requested.
+      console.warn(`[ClawRouter] Existing proxy on port ${listenPort} does not report paymentChain (pre-v0.11 instance). Assuming Base.`);
       throw new Error(
-        `Existing proxy on port ${listenPort} is using ${existingProxy.paymentChain} but ${paymentChain} was requested. ` +
+        `Existing proxy on port ${listenPort} is a pre-v0.11 instance (assumed Base) but ${paymentChain} was requested. ` +
         `Stop the existing proxy first or use a different port.`,
       );
     }
@@ -1393,11 +1402,11 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
         if (err.code === "EADDRINUSE") {
           // Port is in use - check if a proxy is actually running
-          const existingWallet = await checkExistingProxy(listenPort);
-          if (existingWallet) {
+          const existingProxy2 = await checkExistingProxy(listenPort);
+          if (existingProxy2) {
             // Proxy is actually running - this is fine, reuse it
             console.log(`[ClawRouter] Existing proxy detected on port ${listenPort}, reusing`);
-            rejectAttempt({ code: "REUSE_EXISTING", wallet: existingWallet });
+            rejectAttempt({ code: "REUSE_EXISTING", wallet: existingProxy2.wallet, existingChain: existingProxy2.paymentChain });
             return;
           }
 
@@ -1436,9 +1445,17 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       await tryListen(attempt);
       break; // Success
     } catch (err: unknown) {
-      const error = err as { code?: string; wallet?: string; attempt?: number };
+      const error = err as { code?: string; wallet?: string; existingChain?: string; attempt?: number };
 
       if (error.code === "REUSE_EXISTING" && error.wallet) {
+        // Validate payment chain matches (same check as pre-listen reuse path)
+        if (error.existingChain && error.existingChain !== paymentChain) {
+          throw new Error(
+            `Existing proxy on port ${listenPort} is using ${error.existingChain} but ${paymentChain} was requested. ` +
+            `Stop the existing proxy first or use a different port.`,
+          );
+        }
+
         // Proxy is running, reuse it
         const baseUrl = `http://127.0.0.1:${listenPort}`;
         options.onReady?.(listenPort);
