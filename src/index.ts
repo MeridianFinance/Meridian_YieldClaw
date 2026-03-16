@@ -546,28 +546,16 @@ async function createStatsCommand(): Promise<OpenClawPluginCommandDefinition> {
 
 /**
  * /wallet command handler for ClawRouter.
- * - /wallet or /wallet status: Show wallet address, balance, and key file location
+ * - /wallet or /wallet status: Show wallet address, balance, usage, and key file location
  * - /wallet export: Show private key for backup (with security warning)
  */
 async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
   return {
     name: "wallet",
-    description: "Show BlockRun wallet info or export private key for backup",
+    description: "Show BlockRun wallet info, usage stats, or export private key",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: PluginCommandContext) => {
-      // Only handle /wallet when the active model is a BlockRun model.
-      // Otherwise, return null so OpenClaw falls through to its native
-      // provider wallet (e.g. Codex usage on a Codex LLM).
-      const primary = String(
-        (ctx.config as Record<string, unknown> & { agents?: { defaults?: { model?: { primary?: string } } } })
-          ?.agents?.defaults?.model?.primary ?? "",
-      );
-      if (!primary.startsWith("blockrun/")) {
-        // Return null so OpenClaw falls through to native /wallet handler
-        return null as any; // eslint-disable-line @typescript-eslint/no-explicit-any
-      }
-
       const subcommand = ctx.args?.trim().toLowerCase() || "status";
 
       // Read wallet key if it exists
@@ -771,6 +759,37 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
       // Show current chain selection
       const currentChain = await resolvePaymentChain();
 
+      // Usage summary (last 7 days) — shows all models including openai/, anthropic/, etc.
+      let usageSection = "";
+      try {
+        const stats = await getStats(7);
+        if (stats.totalRequests > 0) {
+          const modelLines = Object.entries(stats.byModel)
+            .sort((a, b) => b[1].count - a[1].count)
+            .slice(0, 8)
+            .map(
+              ([model, data]) =>
+                `  ${model.length > 30 ? model.slice(0, 27) + "..." : model}  ${data.count} reqs  $${data.cost.toFixed(4)}`,
+            );
+
+          usageSection = [
+            "",
+            `**Usage (${stats.period}):**`,
+            `  Total: ${stats.totalRequests} requests, $${stats.totalCost.toFixed(4)} spent`,
+            stats.totalSavings > 0
+              ? `  Saved: $${stats.totalSavings.toFixed(4)} (${stats.savingsPercentage.toFixed(0)}% vs Opus baseline)`
+              : "",
+            "",
+            "**Top Models:**",
+            ...modelLines,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+      } catch {
+        // Stats not available — skip
+      }
+
       return {
         text: [
           "**ClawRouter Wallet**",
@@ -782,12 +801,14 @@ async function createWalletCommand(): Promise<OpenClawPluginCommandDefinition> {
           `  ${evmBalanceText}`,
           `  Fund (USDC only): https://basescan.org/address/${address}`,
           solanaSection,
+          usageSection,
           "",
           `**Key File:** \`${WALLET_FILE}\``,
           "",
           "**Commands:**",
           "• `/wallet` - Show this status",
           "• `/wallet export` - Export private key for backup",
+          "• `/stats` - Detailed usage breakdown",
           !solanaSection ? "• `/wallet solana` - Enable Solana payments" : "",
           solanaSection ? "• `/wallet base` - Switch to Base (EVM)" : "",
           solanaSection ? "• `/wallet solana` - Switch to Solana" : "",
@@ -899,7 +920,7 @@ const plugin: OpenClawPluginDefinition = {
       );
     }
 
-    // Register /wallet command for wallet management
+    // Register /wallet command — shows wallet info + per-model usage stats
     createWalletCommand()
       .then((walletCommand) => {
         api.registerCommand(walletCommand);
