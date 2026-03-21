@@ -3823,6 +3823,35 @@ async function proxyRequest(
         status: result.errorStatus || 500,
       });
 
+      // Payment error (insufficient funds, simulation failure) — skip remaining
+      // paid models, jump straight to free model. No point trying other paid
+      // models with the same wallet state.
+      // Must be checked BEFORE isProviderError gate: payment settlement failures
+      // may return non-standard HTTP codes that categorizeError doesn't recognize,
+      // causing isProviderError=false and breaking out of the fallback loop.
+      const isPaymentErr =
+        /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
+          result.errorBody || "",
+        );
+      if (isPaymentErr && tryModel !== FREE_MODEL && !isLastAttempt) {
+        failedAttempts.push({
+          ...failedAttempts[failedAttempts.length - 1],
+          reason: "payment_error",
+        });
+        const freeIdx = modelsToTry.indexOf(FREE_MODEL);
+        if (freeIdx > i + 1) {
+          console.log(`[ClawRouter] Payment error — skipping to free model: ${FREE_MODEL}`);
+          i = freeIdx - 1; // loop will increment to freeIdx
+          continue;
+        }
+        // Free model not in chain — add it and try
+        if (freeIdx === -1) {
+          modelsToTry.push(FREE_MODEL);
+          console.log(`[ClawRouter] Payment error — appending free model: ${FREE_MODEL}`);
+          continue;
+        }
+      }
+
       // If it's a provider error and not the last attempt, try next model
       if (result.isProviderError && !isLastAttempt) {
         const isExplicitModelError = !routingDecision;
@@ -3910,22 +3939,6 @@ async function proxyRequest(
           console.log(
             `[ClawRouter] 🔑 ${errorCat === "auth_failure" ? "Auth failure" : "Quota exceeded"} for ${tryModel} — check provider config`,
           );
-        }
-
-        // Payment error (insufficient funds, simulation failure) — skip remaining
-        // paid models, jump straight to free model. No point trying other paid
-        // models with the same wallet state.
-        const isPaymentErr =
-          /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
-            result.errorBody || "",
-          );
-        if (isPaymentErr && tryModel !== FREE_MODEL) {
-          const freeIdx = modelsToTry.indexOf(FREE_MODEL);
-          if (freeIdx > i + 1) {
-            console.log(`[ClawRouter] Payment error — skipping to free model: ${FREE_MODEL}`);
-            i = freeIdx - 1; // loop will increment to freeIdx
-            continue;
-          }
         }
 
         console.log(

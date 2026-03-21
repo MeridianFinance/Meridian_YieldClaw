@@ -49620,6 +49620,26 @@ data: [DONE]
         reason: result.errorCategory || `HTTP ${result.errorStatus || 500}`,
         status: result.errorStatus || 500
       });
+      const isPaymentErr = /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
+        result.errorBody || ""
+      );
+      if (isPaymentErr && tryModel !== FREE_MODEL && !isLastAttempt) {
+        failedAttempts.push({
+          ...failedAttempts[failedAttempts.length - 1],
+          reason: "payment_error"
+        });
+        const freeIdx = modelsToTry.indexOf(FREE_MODEL);
+        if (freeIdx > i + 1) {
+          console.log(`[ClawRouter] Payment error \u2014 skipping to free model: ${FREE_MODEL}`);
+          i = freeIdx - 1;
+          continue;
+        }
+        if (freeIdx === -1) {
+          modelsToTry.push(FREE_MODEL);
+          console.log(`[ClawRouter] Payment error \u2014 appending free model: ${FREE_MODEL}`);
+          continue;
+        }
+      }
       if (result.isProviderError && !isLastAttempt) {
         const isExplicitModelError = !routingDecision;
         const isUnknownExplicitModel = isExplicitModelError && /unknown.*model|invalid.*model/i.test(result.errorBody || "");
@@ -49696,17 +49716,6 @@ data: [DONE]
           console.log(
             `[ClawRouter] \u{1F511} ${errorCat === "auth_failure" ? "Auth failure" : "Quota exceeded"} for ${tryModel} \u2014 check provider config`
           );
-        }
-        const isPaymentErr = /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
-          result.errorBody || ""
-        );
-        if (isPaymentErr && tryModel !== FREE_MODEL) {
-          const freeIdx = modelsToTry.indexOf(FREE_MODEL);
-          if (freeIdx > i + 1) {
-            console.log(`[ClawRouter] Payment error \u2014 skipping to free model: ${FREE_MODEL}`);
-            i = freeIdx - 1;
-            continue;
-          }
         }
         console.log(
           `[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`
