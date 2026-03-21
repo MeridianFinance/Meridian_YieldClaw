@@ -1,6 +1,6 @@
 # Building a Smart LLM Router: How We Benchmarked 46 Models and Built a 14-Dimension Classifier
 
-*March 20, 2026 | BlockRun Engineering*
+_March 20, 2026 | BlockRun Engineering_
 
 When you route AI requests across 46 models from 8 providers, you can't just pick the cheapest one. You can't just pick the fastest one either. We learned this the hard way.
 
@@ -170,22 +170,22 @@ User Prompt → Lowercase + Tokenize
 
 ### The 14 Dimensions
 
-| Dimension | Weight | What It Detects | Score Range |
-|-----------|--------|-----------------|-------------|
-| reasoningMarkers | 0.18 | "prove", "theorem", "step by step" | 0 to 1.0 |
-| codePresence | 0.15 | "function", "class", "import", "```" | 0 to 1.0 |
-| multiStepPatterns | 0.12 | "first...then", "step N", numbered lists | 0 or 0.5 |
-| technicalTerms | 0.10 | "algorithm", "kubernetes", "distributed" | 0 to 1.0 |
-| tokenCount | 0.08 | Short (<50 tokens) vs long (>500 tokens) | -1.0 to 1.0 |
-| creativeMarkers | 0.05 | "story", "poem", "brainstorm" | 0 to 0.7 |
-| questionComplexity | 0.05 | Number of question marks (>3 = complex) | 0 or 0.5 |
-| agenticTask | 0.04 | "edit", "deploy", "fix", "debug" | 0 to 1.0 |
-| constraintCount | 0.04 | "at most", "within", "O()" | 0 to 0.7 |
-| imperativeVerbs | 0.03 | "build", "create", "implement" | 0 to 0.5 |
-| outputFormat | 0.03 | "json", "yaml", "table", "csv" | 0 to 0.7 |
-| simpleIndicators | 0.02 | "what is", "hello", "define" | 0 to -1.0 |
-| referenceComplexity | 0.02 | "the code above", "the API docs" | 0 to 0.5 |
-| domainSpecificity | 0.02 | "quantum", "FPGA", "genomics" | 0 to 0.8 |
+| Dimension           | Weight | What It Detects                          | Score Range |
+| ------------------- | ------ | ---------------------------------------- | ----------- |
+| reasoningMarkers    | 0.18   | "prove", "theorem", "step by step"       | 0 to 1.0    |
+| codePresence        | 0.15   | "function", "class", "import", "```"     | 0 to 1.0    |
+| multiStepPatterns   | 0.12   | "first...then", "step N", numbered lists | 0 or 0.5    |
+| technicalTerms      | 0.10   | "algorithm", "kubernetes", "distributed" | 0 to 1.0    |
+| tokenCount          | 0.08   | Short (<50 tokens) vs long (>500 tokens) | -1.0 to 1.0 |
+| creativeMarkers     | 0.05   | "story", "poem", "brainstorm"            | 0 to 0.7    |
+| questionComplexity  | 0.05   | Number of question marks (>3 = complex)  | 0 or 0.5    |
+| agenticTask         | 0.04   | "edit", "deploy", "fix", "debug"         | 0 to 1.0    |
+| constraintCount     | 0.04   | "at most", "within", "O()"               | 0 to 0.7    |
+| imperativeVerbs     | 0.03   | "build", "create", "implement"           | 0 to 0.5    |
+| outputFormat        | 0.03   | "json", "yaml", "table", "csv"           | 0 to 0.7    |
+| simpleIndicators    | 0.02   | "what is", "hello", "define"             | 0 to -1.0   |
+| referenceComplexity | 0.02   | "the code above", "the API docs"         | 0 to 0.5    |
+| domainSpecificity   | 0.02   | "quantum", "FPGA", "genomics"            | 0 to 0.8    |
 
 Weights sum to 1.0. The weighted score maps to a continuous axis where tier boundaries partition the space.
 
@@ -251,15 +251,15 @@ Each tier config includes an ordered fallback list. When the primary model retur
 ```typescript
 // COMPLEX tier — quality-first fallback order
 fallback: [
-  "google/gemini-3-pro-preview",      // IQ 48, 1,352ms
-  "google/gemini-3-flash-preview",     // IQ 46, 1,398ms
-  "xai/grok-4-0709",                   // IQ 41, 1,348ms
-  "google/gemini-2.5-pro",             // 1,294ms
-  "anthropic/claude-sonnet-4.6",       // IQ 52, 2,110ms
-  "deepseek/deepseek-chat",            // IQ 32, 1,431ms
-  "google/gemini-2.5-flash",           // IQ 20, 1,238ms
-  "openai/gpt-5.4",                    // IQ 57, 6,213ms — last resort
-]
+  "google/gemini-3-pro-preview", // IQ 48, 1,352ms
+  "google/gemini-3-flash-preview", // IQ 46, 1,398ms
+  "xai/grok-4-0709", // IQ 41, 1,348ms
+  "google/gemini-2.5-pro", // 1,294ms
+  "anthropic/claude-sonnet-4.6", // IQ 52, 2,110ms
+  "deepseek/deepseek-chat", // IQ 32, 1,431ms
+  "google/gemini-2.5-flash", // IQ 20, 1,238ms
+  "openai/gpt-5.4", // IQ 57, 6,213ms — last resort
+];
 ```
 
 The chain descends by quality first (IQ 48 → 46 → 41), then trades quality for speed. GPT-5.4 is last despite having IQ 57, because its 6.2s latency is a worst-case user experience.
@@ -279,10 +279,11 @@ If filtering eliminates all candidates, the full chain is used as a fallback (be
 Every routing decision includes a cost estimate and savings percentage against a baseline (Claude Opus 4.6 pricing):
 
 ```typescript
-savings = max(0, (opusCost - routedCost) / opusCost)
+savings = max(0, (opusCost - routedCost) / opusCost);
 ```
 
 For a typical SIMPLE request (500 input tokens, 256 output tokens):
+
 - Opus cost: $0.0089 (at $5.00/$25.00 per 1M tokens)
 - Gemini Flash cost: $0.0008 (at $0.30/$2.50 per 1M tokens)
 - Savings: 91.0%
@@ -319,4 +320,4 @@ Scoring implementation: [`src/router/rules.ts`](https://github.com/BlockRunAI/Cl
 
 ---
 
-*BlockRun is the x402 micropayment gateway for AI. One wallet, 46+ models, pay-per-request with USDC. [blockrun.ai](https://blockrun.ai)*
+_BlockRun is the x402 micropayment gateway for AI. One wallet, 46+ models, pay-per-request with USDC. [blockrun.ai](https://blockrun.ai)_

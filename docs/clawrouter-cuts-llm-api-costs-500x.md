@@ -1,6 +1,6 @@
 # The Most AI-Agent-Native Router for OpenClaw
 
-> *OpenClaw is one of the best AI agent frameworks available. Its LLM abstraction layer is not.*
+> _OpenClaw is one of the best AI agent frameworks available. Its LLM abstraction layer is not._
 
 ---
 
@@ -10,9 +10,9 @@
 
 From [openclaw/openclaw#3181](https://github.com/openclaw/openclaw/issues/3181):
 
-> *"We ended up at $248/day before we caught it. Heartbeat on Opus 4.6 with a large context. The dedup fix reduced trigger rate, but there's nothing bounding the run itself."*
+> _"We ended up at $248/day before we caught it. Heartbeat on Opus 4.6 with a large context. The dedup fix reduced trigger rate, but there's nothing bounding the run itself."_
 
-> *"11.3M input tokens in 1 hour on claude-opus-4-6 (128K context), ~$20/hour."*
+> _"11.3M input tokens in 1 hour on claude-opus-4-6 (128K context), ~$20/hour."_
 
 Both users ended up disabling heartbeat entirely. The workaround: `heartbeat.every: "0"` — turning off the feature to avoid burning money.
 
@@ -62,15 +62,15 @@ Agents are the worst offenders for context bloat. Tool call results are verbose.
 
 ClawRouter compresses every request through 7 layers before it hits the wire:
 
-| Layer | What it does | Saves |
-|-------|-------------|-------|
-| Deduplication | Removes repeated messages (retries, echoes) | Variable |
-| Whitespace | Strips excessive whitespace from all content | 2–8% |
-| Dictionary | Replaces common phrases with short codes | 5–15% |
-| Path shortening | Codebook for repeated file paths in tool results | 3–10% |
-| JSON compaction | Removes whitespace from embedded JSON | 5–12% |
-| **Observation compression** | **Summarizes tool results to key information** | **Up to 97%** |
-| Dynamic codebook | Learns repetitions in the actual conversation | 3–15% |
+| Layer                       | What it does                                     | Saves         |
+| --------------------------- | ------------------------------------------------ | ------------- |
+| Deduplication               | Removes repeated messages (retries, echoes)      | Variable      |
+| Whitespace                  | Strips excessive whitespace from all content     | 2–8%          |
+| Dictionary                  | Replaces common phrases with short codes         | 5–15%         |
+| Path shortening             | Codebook for repeated file paths in tool results | 3–10%         |
+| JSON compaction             | Removes whitespace from embedded JSON            | 5–12%         |
+| **Observation compression** | **Summarizes tool results to key information**   | **Up to 97%** |
+| Dynamic codebook            | Learns repetitions in the actual conversation    | 3–15%         |
 
 Layer 6 is the big one. Tool results — file reads, API responses, shell output — can be 10KB+ each. The actual useful signal is often 200–300 chars. ClawRouter extracts errors, status lines, key JSON fields, and compresses the rest. Same model intelligence, 97% fewer tokens on the bulk.
 
@@ -153,20 +153,20 @@ There is no monthly invoice. There is no 3am email. There is a wallet balance, a
 
 <p align="center"><img src="assets/blockrun-clawrouter-vs-openclaw-standalone-comparison-production-safety.png" alt="Architecting for production safety — OpenClaw standalone vs OpenClaw + ClawRouter comparison across cost, context, error handling, and budgeting" width="720"></p>
 
-| Problem | OpenClaw alone | OpenClaw + ClawRouter |
-|---------|---------------|----------------------|
-| Heartbeat cost overrun | No per-run cap | Tier routing → 50–500× cheaper model |
-| Large context | Full context every call | 7-layer compression, 15–40% reduction |
-| Tool result bloat | Raw output forwarded | Observation compression, up to 97% |
-| Rate limit contaminates profile | All models penalized (#49834) | Per-model 60s cooldown, others unaffected |
-| Empty / degraded 200 response | Passed through to agent (#49902) | Detected, triggers model fallback |
-| Short-burst 429 failover | Immediate failover to next model | 200ms retry first, failover only if needed |
-| MiniMax 520 failure | Silent drop / retry storm | Classified as server_error, retried correctly |
-| Z.ai 1311 (billing) | Treated as rate_limit, retried | Classified as billing, stopped immediately |
-| Mid-task model switch | Model can change mid-session | Session pinning, consistent model per task |
-| Monthly billing surprise | Possible | Wallet-based, stops when empty |
-| Per-session cost ceiling | None | `maxCostPerRun` — graceful or strict cap |
-| Cost visibility | None | `/stats` with per-provider error counts |
+| Problem                         | OpenClaw alone                   | OpenClaw + ClawRouter                         |
+| ------------------------------- | -------------------------------- | --------------------------------------------- |
+| Heartbeat cost overrun          | No per-run cap                   | Tier routing → 50–500× cheaper model          |
+| Large context                   | Full context every call          | 7-layer compression, 15–40% reduction         |
+| Tool result bloat               | Raw output forwarded             | Observation compression, up to 97%            |
+| Rate limit contaminates profile | All models penalized (#49834)    | Per-model 60s cooldown, others unaffected     |
+| Empty / degraded 200 response   | Passed through to agent (#49902) | Detected, triggers model fallback             |
+| Short-burst 429 failover        | Immediate failover to next model | 200ms retry first, failover only if needed    |
+| MiniMax 520 failure             | Silent drop / retry storm        | Classified as server_error, retried correctly |
+| Z.ai 1311 (billing)             | Treated as rate_limit, retried   | Classified as billing, stopped immediately    |
+| Mid-task model switch           | Model can change mid-session     | Session pinning, consistent model per task    |
+| Monthly billing surprise        | Possible                         | Wallet-based, stops when empty                |
+| Per-session cost ceiling        | None                             | `maxCostPerRun` — graceful or strict cap      |
+| Cost visibility                 | None                             | `/stats` with per-provider error counts       |
 
 ---
 
@@ -194,4 +194,4 @@ That's what ClawRouter is for.
 
 ---
 
-*[github.com/BlockRunAI/ClawRouter](https://github.com/BlockRunAI/ClawRouter) · [blockrun.ai](https://blockrun.ai) · `npm install -g @blockrun/clawrouter`*
+_[github.com/BlockRunAI/ClawRouter](https://github.com/BlockRunAI/ClawRouter) · [blockrun.ai](https://blockrun.ai) · `npm install -g @blockrun/clawrouter`_
