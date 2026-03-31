@@ -24,6 +24,7 @@ GET `http://localhost:8402/v1/pm/polymarket/events?limit=20`
 Common params: `limit`, `offset`, `tag` (e.g. `crypto`, `politics`, `sports`)
 
 Response fields in `data`:
+
 - `events[].title` — market name
 - `events[].outcomes` — array of `{ name, price }` (price = implied probability 0–1)
 - `events[].volume` — total volume in USD
@@ -33,6 +34,7 @@ Response fields in `data`:
 To search by keyword: `GET /v1/pm/polymarket/markets?search=bitcoin&limit=10`
 
 Response fields in `data`:
+
 - `markets[].question` — market question
 - `markets[].conditionId`
 - `markets[].outcomes[].price`
@@ -47,6 +49,7 @@ Find the `conditionId` first (from events/markets above), then:
 GET `http://localhost:8402/v1/pm/polymarket/market/{conditionId}/smart-money`
 
 Response fields in `data`:
+
 - `positions[].wallet` — wallet address
 - `positions[].side` — YES or NO
 - `positions[].size` — position size in USD
@@ -60,6 +63,7 @@ Response fields in `data`:
 GET `http://localhost:8402/v1/pm/polymarket/leaderboard?limit=20`
 
 Response fields in `data`:
+
 - `wallets[].address`
 - `wallets[].profit` — total realized profit in USD
 - `wallets[].volume`
@@ -73,6 +77,7 @@ Response fields in `data`:
 GET `http://localhost:8402/v1/pm/polymarket/wallet/{walletAddress}`
 
 Response fields in `data`:
+
 - `profit` — total realized profit
 - `volume` — total traded volume
 - `winRate` — fraction of winning trades (0–1)
@@ -80,6 +85,7 @@ Response fields in `data`:
 - `currentPositions[]` — open positions
 
 For P&L over time: GET `/v1/pm/polymarket/wallet/pnl/{walletAddress}`
+
 - `data.pnlSeries[]` — `{ date, cumulativePnl }`
 - `data.totalProfit`, `data.totalLoss`
 
@@ -90,6 +96,7 @@ For P&L over time: GET `/v1/pm/polymarket/wallet/pnl/{walletAddress}`
 GET `http://localhost:8402/v1/pm/matching-markets?limit=10`
 
 Response fields in `data`:
+
 - `pairs[].polymarketTitle`
 - `pairs[].kalshiTitle`
 - `pairs[].polymarketPrice` — YES price on Polymarket (0–1)
@@ -121,44 +128,44 @@ Response fields in `data`:
 
 All endpoints are GET. Query params go in the URL.
 
-| Endpoint | Price | Key params |
-|----------|-------|------------|
-| `/v1/pm/polymarket/events` | $0.001 | `limit`, `offset`, `tag` |
-| `/v1/pm/polymarket/markets` | $0.001 | `search`, `limit`, `offset` |
-| `/v1/pm/polymarket/crypto-updown` | $0.001 | — |
-| `/v1/pm/polymarket/leaderboard` | $0.001 | `limit`, `offset` |
-| `/v1/pm/polymarket/leaderboard/market/{conditionId}` | $0.001 | `limit` |
-| `/v1/pm/polymarket/market/{conditionId}/top-holders` | $0.001 | `limit` |
-| `/v1/pm/polymarket/cohorts/stats` | $0.001 | — |
-| `/v1/pm/polymarket/positions` | $0.001 | `wallet`, `limit` |
-| `/v1/pm/polymarket/trades` | $0.001 | `wallet`, `limit`, `start_ts`, `end_ts` |
-| `/v1/pm/polymarket/orderbooks` | $0.001 | `tokenId`, `limit` |
-| `/v1/pm/polymarket/market-price/{tokenId}` | $0.001 | `startTs`, `endTs` |
-| `/v1/pm/polymarket/candlesticks/{conditionId}` | $0.001 | `period`, `limit` |
-| `/v1/pm/polymarket/volume-chart/{conditionId}` | $0.001 | — |
-| `/v1/pm/polymarket/wallet/{wallet}` | $0.005 | — |
-| `/v1/pm/polymarket/wallet/{wallet}/markets` | $0.005 | `limit` |
-| `/v1/pm/polymarket/wallet/{wallet}/similar` | $0.005 | — |
-| `/v1/pm/polymarket/wallet/pnl/{wallet}` | $0.005 | — |
-| `/v1/pm/polymarket/wallet/positions/{wallet}` | $0.005 | — |
-| `/v1/pm/polymarket/wallet/volume-chart/{wallet}` | $0.005 | — |
-| `/v1/pm/polymarket/wallets/profiles` | $0.005 | `wallets` (comma-separated) |
-| `/v1/pm/polymarket/wallets/filter` | $0.005 | `conditionId`, `side` |
-| `/v1/pm/polymarket/market/{conditionId}/smart-money` | $0.005 | `limit` |
-| `/v1/pm/polymarket/markets/smart-activity` | $0.005 | `limit` |
-| `/v1/pm/kalshi/markets` | $0.001 | `search`, `limit` |
-| `/v1/pm/kalshi/trades` | $0.001 | `limit` |
-| `/v1/pm/kalshi/orderbooks` | $0.001 | `marketId` |
-| `/v1/pm/dflow/trades` | $0.001 | `wallet`, `limit` |
-| `/v1/pm/dflow/wallet/positions/{wallet}` | $0.005 | — |
-| `/v1/pm/dflow/wallet/pnl/{wallet}` | $0.005 | — |
-| `/v1/pm/binance/candles/{symbol}` | $0.005 | `interval`, `limit` |
-| `/v1/pm/binance/ticks/{symbol}` | $0.005 | `limit` |
-| `/v1/pm/matching-markets` | $0.005 | `limit`, `offset` |
-| `/v1/pm/matching-markets/pairs` | $0.005 | — |
-| `/v1/pm/limitless/orderbooks` | $0.001 | `marketId` |
-| `/v1/pm/opinion/orderbooks` | $0.001 | `marketId` |
-| `/v1/pm/predictfun/orderbooks` | $0.001 | `marketId` |
+| Endpoint                                             | Price  | Key params                              |
+| ---------------------------------------------------- | ------ | --------------------------------------- |
+| `/v1/pm/polymarket/events`                           | $0.001 | `limit`, `offset`, `tag`                |
+| `/v1/pm/polymarket/markets`                          | $0.001 | `search`, `limit`, `offset`             |
+| `/v1/pm/polymarket/crypto-updown`                    | $0.001 | —                                       |
+| `/v1/pm/polymarket/leaderboard`                      | $0.001 | `limit`, `offset`                       |
+| `/v1/pm/polymarket/leaderboard/market/{conditionId}` | $0.001 | `limit`                                 |
+| `/v1/pm/polymarket/market/{conditionId}/top-holders` | $0.001 | `limit`                                 |
+| `/v1/pm/polymarket/cohorts/stats`                    | $0.001 | —                                       |
+| `/v1/pm/polymarket/positions`                        | $0.001 | `wallet`, `limit`                       |
+| `/v1/pm/polymarket/trades`                           | $0.001 | `wallet`, `limit`, `start_ts`, `end_ts` |
+| `/v1/pm/polymarket/orderbooks`                       | $0.001 | `tokenId`, `limit`                      |
+| `/v1/pm/polymarket/market-price/{tokenId}`           | $0.001 | `startTs`, `endTs`                      |
+| `/v1/pm/polymarket/candlesticks/{conditionId}`       | $0.001 | `period`, `limit`                       |
+| `/v1/pm/polymarket/volume-chart/{conditionId}`       | $0.001 | —                                       |
+| `/v1/pm/polymarket/wallet/{wallet}`                  | $0.005 | —                                       |
+| `/v1/pm/polymarket/wallet/{wallet}/markets`          | $0.005 | `limit`                                 |
+| `/v1/pm/polymarket/wallet/{wallet}/similar`          | $0.005 | —                                       |
+| `/v1/pm/polymarket/wallet/pnl/{wallet}`              | $0.005 | —                                       |
+| `/v1/pm/polymarket/wallet/positions/{wallet}`        | $0.005 | —                                       |
+| `/v1/pm/polymarket/wallet/volume-chart/{wallet}`     | $0.005 | —                                       |
+| `/v1/pm/polymarket/wallets/profiles`                 | $0.005 | `wallets` (comma-separated)             |
+| `/v1/pm/polymarket/wallets/filter`                   | $0.005 | `conditionId`, `side`                   |
+| `/v1/pm/polymarket/market/{conditionId}/smart-money` | $0.005 | `limit`                                 |
+| `/v1/pm/polymarket/markets/smart-activity`           | $0.005 | `limit`                                 |
+| `/v1/pm/kalshi/markets`                              | $0.001 | `search`, `limit`                       |
+| `/v1/pm/kalshi/trades`                               | $0.001 | `limit`                                 |
+| `/v1/pm/kalshi/orderbooks`                           | $0.001 | `marketId`                              |
+| `/v1/pm/dflow/trades`                                | $0.001 | `wallet`, `limit`                       |
+| `/v1/pm/dflow/wallet/positions/{wallet}`             | $0.005 | —                                       |
+| `/v1/pm/dflow/wallet/pnl/{wallet}`                   | $0.005 | —                                       |
+| `/v1/pm/binance/candles/{symbol}`                    | $0.005 | `interval`, `limit`                     |
+| `/v1/pm/binance/ticks/{symbol}`                      | $0.005 | `limit`                                 |
+| `/v1/pm/matching-markets`                            | $0.005 | `limit`, `offset`                       |
+| `/v1/pm/matching-markets/pairs`                      | $0.005 | —                                       |
+| `/v1/pm/limitless/orderbooks`                        | $0.001 | `marketId`                              |
+| `/v1/pm/opinion/orderbooks`                          | $0.001 | `marketId`                              |
+| `/v1/pm/predictfun/orderbooks`                       | $0.001 | `marketId`                              |
 
 ---
 

@@ -36,21 +36,23 @@ Display inline: `![generated image](http://localhost:8402/images/abc123.png)`
 
 ### Model Selection
 
-| Model | Full ID | Price | Sizes | Best for |
-|-------|---------|-------|-------|----------|
-| `nano-banana` | `google/nano-banana` | $0.05 | 1024×1024, 1216×832, 1024×1792 | Default — fast, cheap, good quality |
-| `banana-pro` | `google/nano-banana-pro` | $0.10 | up to 4096×4096 | High-res, large format |
-| `dall-e-3` | `openai/dall-e-3` | $0.04 | 1024×1024, 1792×1024, 1024×1792 | Photorealistic, complex scenes |
-| `gpt-image` | `openai/gpt-image-1` | $0.02 | 1024×1024, 1536×1024, 1024×1536 | Budget option |
-| `flux` | `black-forest/flux-1.1-pro` | $0.04 | 1024×1024, 1216×832, 832×1216 | Artistic styles, fewer restrictions |
+| Model         | Full ID                     | Price | Sizes                           | Best for                            |
+| ------------- | --------------------------- | ----- | ------------------------------- | ----------------------------------- |
+| `nano-banana` | `google/nano-banana`        | $0.05 | 1024×1024, 1216×832, 1024×1792  | Default — fast, cheap, good quality |
+| `banana-pro`  | `google/nano-banana-pro`    | $0.10 | up to 4096×4096                 | High-res, large format              |
+| `dall-e-3`    | `openai/dall-e-3`           | $0.04 | 1024×1024, 1792×1024, 1024×1792 | Photorealistic, complex scenes      |
+| `gpt-image`   | `openai/gpt-image-1`        | $0.02 | 1024×1024, 1536×1024, 1024×1536 | Budget option                       |
+| `flux`        | `black-forest/flux-1.1-pro` | $0.04 | 1024×1024, 1216×832, 832×1216   | Artistic styles, fewer restrictions |
 
 **Choosing a model:**
+
 - Default → `nano-banana`
 - "high res" / "large" → `banana-pro`
 - "photorealistic" / "dall-e" → `dall-e-3`
 - "artistic" / flexible content → `flux`
 
 **Choosing a size:**
+
 - Default: `1024x1024`
 - Portrait: `1024x1792`
 - Landscape: `1792x1024` (dall-e-3) or `1216x832` (nano-banana / flux)
