@@ -19,7 +19,13 @@
  *   - Usage logging: log every request as JSON line to ~/.openclaw/blockrun/logs/
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+
+// Per-request payment tracking via AsyncLocalStorage (safe for concurrent requests).
+// The x402 onAfterPaymentCreation hook writes the actual payment amount into the
+// request-scoped store, and the logging code reads it after payFetch completes.
+const paymentStore = new AsyncLocalStorage<{ amountUsd: number }>();
 import { finished } from "node:stream";
 import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
@@ -39,6 +45,7 @@ import {
   getFallbackChainFiltered,
   filterByToolCalling,
   filterByVision,
+  filterByExcludeList,
   calculateModelCost,
   DEFAULT_ROUTING_CONFIG,
   type RouterOptions,
@@ -80,6 +87,7 @@ import {
   type SessionConfig,
 } from "./session.js";
 import { checkForUpdates } from "./updater.js";
+import { loadExcludeList } from "./exclude-models.js";
 import { PROXY_PORT } from "./config.js";
 import { SessionJournal } from "./journal.js";
 
@@ -90,8 +98,6 @@ const IMAGE_DIR = join(homedir(), ".openclaw", "blockrun", "images");
 const AUTO_MODEL = "blockrun/auto";
 
 const ROUTING_PROFILES = new Set([
-  "blockrun/free",
-  "free",
   "blockrun/eco",
   "eco",
   "blockrun/auto",
@@ -99,14 +105,31 @@ const ROUTING_PROFILES = new Set([
   "blockrun/premium",
   "premium",
 ]);
-const FREE_MODEL = "nvidia/gpt-oss-120b"; // Free model for empty wallet fallback
-const FREE_TIER_CONFIGS: Record<Tier, { primary: string; fallback: string[] }> = {
-  SIMPLE: { primary: FREE_MODEL, fallback: [] },
-  MEDIUM: { primary: FREE_MODEL, fallback: [] },
-  COMPLEX: { primary: FREE_MODEL, fallback: [] },
-  REASONING: { primary: FREE_MODEL, fallback: [] },
-};
-let freeRequestCount = 0;
+const FREE_MODEL = "free/gpt-oss-120b"; // Last-resort single free model fallback
+const FREE_MODELS = new Set([
+  "free/gpt-oss-120b",
+  "free/gpt-oss-20b",
+  "free/nemotron-ultra-253b",
+  "free/nemotron-3-super-120b",
+  "free/nemotron-super-49b",
+  "free/deepseek-v3.2",
+  "free/mistral-large-3-675b",
+  "free/qwen3-coder-480b",
+  "free/devstral-2-123b",
+  "free/glm-4.7",
+  "free/llama-4-maverick",
+]);
+/**
+ * Map free/xxx model IDs to nvidia/xxx for upstream BlockRun API.
+ * The "free/" prefix is a ClawRouter convention for the /model picker;
+ * BlockRun server expects "nvidia/" prefix.
+ */
+function toUpstreamModelId(modelId: string): string {
+  if (modelId.startsWith("free/")) {
+    return "nvidia/" + modelId.slice("free/".length);
+  }
+  return modelId;
+}
 const MAX_MESSAGES = 200; // BlockRun API limit - truncate older messages if exceeded
 const CONTEXT_LIMIT_KB = 5120; // Server-side limit: 5MB in KB
 const HEARTBEAT_INTERVAL_MS = 2_000;
@@ -335,13 +358,13 @@ function transformPaymentError(errorBody: string): string {
  * so each category can be handled independently without cross-contamination.
  */
 export type ErrorCategory =
-  | "auth_failure"   // 401, 403: Wrong key or forbidden — don't retry with same key
+  | "auth_failure" // 401, 403: Wrong key or forbidden — don't retry with same key
   | "quota_exceeded" // 403 with plan/quota body: Plan limit hit
-  | "rate_limited"   // 429: Actual throttling — 60s cooldown
-  | "overloaded"     // 529, 503+overload body: Provider capacity — 15s cooldown
-  | "server_error"   // 5xx general: Transient — fallback immediately
-  | "payment_error"  // 402: x402 payment or funds issue
-  | "config_error";  // 400, 413: Bad request content — skip this model
+  | "rate_limited" // 429: Actual throttling — 60s cooldown
+  | "overloaded" // 529, 503+overload body: Provider capacity — 15s cooldown
+  | "server_error" // 5xx general: Transient — fallback immediately
+  | "payment_error" // 402: x402 payment or funds issue
+  | "config_error"; // 400, 413: Bad request content — skip this model
 
 /**
  * Classify an upstream error response into a semantic category.
@@ -351,8 +374,7 @@ export function categorizeError(status: number, body: string): ErrorCategory | n
   if (status === 401) return "auth_failure";
   if (status === 402) return "payment_error";
   if (status === 403) {
-    if (/plan.*limit|quota.*exceeded|subscription|allowance/i.test(body))
-      return "quota_exceeded";
+    if (/plan.*limit|quota.*exceeded|subscription|allowance/i.test(body)) return "quota_exceeded";
     return "auth_failure"; // generic 403 = forbidden = likely auth issue
   }
   if (status === 429) return "rate_limited";
@@ -563,6 +585,8 @@ const PROVIDER_ERROR_PATTERNS = [
   /payment.*verification.*failed/i,
   /model.*not.*allowed/i,
   /unknown.*model/i,
+  /reasoning_content.*missing/i, // Thinking model multi-turn: missing reasoning_content → fallback
+  /thinking.*reasoning_content/i,
 ];
 
 /**
@@ -663,6 +687,25 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
       return `degraded response: ${errorText.slice(0, 120)}`;
     }
 
+    // Detect empty-turn responses: model returned 200 but no content and no tool calls.
+    // Happens when models like gemini-3.1-flash-lite receive complex agentic requests
+    // (e.g. Roo Code tool schemas) and produce zero output instead of refusing.
+    const choices = parsed.choices;
+    if (Array.isArray(choices) && choices.length > 0) {
+      const choice = choices[0] as Record<string, unknown>;
+      const msg = (choice.message ?? choice.delta) as Record<string, unknown> | undefined;
+      if (msg) {
+        const content = msg.content;
+        const toolCalls = msg.tool_calls;
+        const hasContent = typeof content === "string" && content.trim().length > 0;
+        const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+        const finishReason = choice.finish_reason as string | null | undefined;
+        if (!hasContent && !hasToolCalls && finishReason === "stop") {
+          return "degraded response: empty turn (no content or tool calls)";
+        }
+      }
+    }
+
     // Successful wrapper with bad assistant content.
     const assistantContent = extractAssistantContent(parsed);
     if (!assistantContent) return undefined;
@@ -677,40 +720,6 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
   }
 
   return undefined;
-}
-
-/**
- * HTTP status codes that indicate provider issues worth retrying with fallback.
- */
-const FALLBACK_STATUS_CODES = [
-  400, // Bad request - sometimes used for billing errors
-  401, // Unauthorized - provider API key issues
-  402, // Payment required - but from upstream, not x402
-  403, // Forbidden - provider restrictions
-  413, // Payload too large - request exceeds model's context limit
-  429, // Rate limited
-  500, // Internal server error
-  502, // Bad gateway
-  503, // Service unavailable
-  504, // Gateway timeout
-];
-
-/**
- * Check if an error response indicates a provider issue that should trigger fallback.
- */
-function isProviderError(status: number, body: string): boolean {
-  // Check status code first
-  if (!FALLBACK_STATUS_CODES.includes(status)) {
-    return false;
-  }
-
-  // For 5xx errors, always fallback
-  if (status >= 500) {
-    return true;
-  }
-
-  // For 4xx errors, check the body for known provider error patterns
-  return PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(body));
 }
 
 /**
@@ -938,11 +947,22 @@ type ExtendedChatMessage = ChatMessage & {
 
 /**
  * Normalize messages for thinking-enabled requests.
- * When thinking/extended_thinking is enabled, assistant messages with tool_calls
+ * When thinking/extended_thinking is enabled, ALL assistant messages in history
  * must have reasoning_content (can be empty string if not present).
- * Error: "400 thinking is enabled but reasoning_content is missing in assistant tool call message"
+ *
+ * Reasoning models like Kimi K2.5, DeepSeek-R1, etc. strip their thinking tokens
+ * before we forward the response to the client. So when the client sends back the
+ * assistant message in a follow-up turn, it lacks reasoning_content. These models
+ * reject the multi-turn history with 400 if any assistant message is missing it.
+ *
+ * Previously only tool-call messages were patched — this missed plain text assistant
+ * messages, causing 100% failures on existing (multi-turn) chats.
+ *
+ * Error examples:
+ *   "400 thinking is enabled but reasoning_content is missing in assistant tool call message"
+ *   "400 thinking is enabled but reasoning_content is missing in assistant message"
  */
-function normalizeMessagesForThinking(messages: ExtendedChatMessage[]): ExtendedChatMessage[] {
+export function normalizeMessagesForThinking(messages: ExtendedChatMessage[]): ExtendedChatMessage[] {
   if (!messages || messages.length === 0) return messages;
 
   let hasChanges = false;
@@ -952,20 +972,10 @@ function normalizeMessagesForThinking(messages: ExtendedChatMessage[]): Extended
       return msg;
     }
 
-    // Check for OpenAI format: tool_calls array
-    const hasOpenAIToolCalls =
-      msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-
-    // Check for Anthropic format: content array with tool_use blocks
-    const hasAnthropicToolUse =
-      Array.isArray(msg.content) &&
-      (msg.content as Array<{ type?: string }>).some((block) => block?.type === "tool_use");
-
-    if (hasOpenAIToolCalls || hasAnthropicToolUse) {
-      hasChanges = true;
-      return { ...msg, reasoning_content: "" };
-    }
-    return msg;
+    // Add reasoning_content: "" to ALL assistant messages.
+    // Reasoning models require it on every assistant turn in history, not just tool-call turns.
+    hasChanges = true;
+    return { ...msg, reasoning_content: "" };
   });
 
   return hasChanges ? normalized : messages;
@@ -1172,6 +1182,12 @@ export type ProxyOptions = {
    * - 'strict': immediately return 429 once the session spend reaches the cap.
    */
   maxCostPerRunMode?: "graceful" | "strict";
+  /**
+   * Set of model IDs to exclude from routing.
+   * Excluded models are filtered out of fallback chains.
+   * Loaded from ~/.openclaw/blockrun/exclude-models.json
+   */
+  excludeModels?: Set<string>;
   onReady?: (port: number) => void;
   onError?: (error: Error) => void;
   onPayment?: (info: { model: string; amount: string; network: string }) => void;
@@ -1271,6 +1287,37 @@ function estimateAmount(
   return amountMicros.toString();
 }
 
+// Image pricing table (must match server's IMAGE_MODELS in blockrun/src/lib/models.ts)
+// Server applies 5% margin on top of these prices.
+const IMAGE_PRICING: Record<string, { default: number; sizes?: Record<string, number> }> = {
+  "openai/dall-e-3": {
+    default: 0.04,
+    sizes: { "1024x1024": 0.04, "1792x1024": 0.08, "1024x1792": 0.08 },
+  },
+  "openai/gpt-image-1": {
+    default: 0.02,
+    sizes: { "1024x1024": 0.02, "1536x1024": 0.04, "1024x1536": 0.04 },
+  },
+  "black-forest/flux-1.1-pro": { default: 0.04 },
+  "google/nano-banana": { default: 0.05 },
+  "google/nano-banana-pro": {
+    default: 0.1,
+    sizes: { "1024x1024": 0.1, "2048x2048": 0.1, "4096x4096": 0.15 },
+  },
+};
+
+/**
+ * Estimate the cost of an image generation/editing request.
+ * Matches server-side calculateImagePrice() including 5% margin.
+ */
+function estimateImageCost(model: string, size?: string, n: number = 1): number {
+  const pricing = IMAGE_PRICING[model];
+  if (!pricing) return 0.04 * n * 1.05; // fallback: assume $0.04/image + margin
+  const sizePrice = size && pricing.sizes ? pricing.sizes[size] : undefined;
+  const pricePerImage = sizePrice ?? pricing.default;
+  return pricePerImage * n * 1.05; // 5% server margin
+}
+
 /**
  * Proxy a partner API request through x402 payment flow.
  *
@@ -1283,6 +1330,7 @@ async function proxyPartnerRequest(
   res: ServerResponse,
   apiBase: string,
   payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  getActualPaymentUsd: () => number,
 ): Promise<void> {
   const startTime = Date.now();
   const upstreamUrl = `${apiBase}${req.url}`;
@@ -1339,13 +1387,14 @@ async function proxyPartnerRequest(
   const latencyMs = Date.now() - startTime;
   console.log(`[ClawRouter] Partner response: ${upstream.status} (${latencyMs}ms)`);
 
-  // Log partner usage (fire-and-forget)
+  // Log partner usage with actual x402 payment amount (previously logged cost: 0)
+  const partnerCost = getActualPaymentUsd();
   logUsage({
     timestamp: new Date().toISOString(),
     model: "partner",
     tier: "PARTNER",
-    cost: 0, // Actual cost handled by x402 settlement
-    baselineCost: 0,
+    cost: partnerCost,
+    baselineCost: partnerCost,
     savings: 0,
     latencyMs,
     partnerId:
@@ -1535,7 +1584,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     console.log(`[ClawRouter] Solana wallet: ${solanaAddress}`);
   }
 
-  // Log which chain is used for each payment
+  // Log which chain is used for each payment and capture actual payment amount
   x402.onAfterPaymentCreation(async (context) => {
     const network = context.selectedRequirements.network;
     const chain = network.startsWith("eip155")
@@ -1543,7 +1592,13 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       : network.startsWith("solana")
         ? "Solana"
         : network;
-    console.log(`[ClawRouter] Payment signed on ${chain} (${network})`);
+    // Capture actual payment amount in USD (amount is in USDC micro units, 6 decimals)
+    const amountMicros = parseInt(context.selectedRequirements.amount || "0", 10);
+    const amountUsd = amountMicros / 1_000_000;
+    // Write to request-scoped store (if available)
+    const store = paymentStore.getStore();
+    if (store) store.amountUsd = amountUsd;
+    console.log(`[ClawRouter] Payment signed on ${chain} (${network}) — $${amountUsd.toFixed(6)}`);
   });
 
   const payFetch = createPayFetchWithPreAuth(fetch, x402, undefined, {
@@ -1584,426 +1639,476 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   // Track active connections for graceful cleanup
   const connections = new Set<import("net").Socket>();
 
-  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    // Add stream error handlers to prevent server crashes
-    req.on("error", (err) => {
-      console.error(`[ClawRouter] Request stream error: ${err.message}`);
-      // Don't throw - just log and let request handler deal with it
-    });
-
-    res.on("error", (err) => {
-      console.error(`[ClawRouter] Response stream error: ${err.message}`);
-      // Don't try to write to failed socket - just log
-    });
-
-    // Finished wrapper for guaranteed cleanup on response completion/error
-    finished(res, (err) => {
-      if (err && err.code !== "ERR_STREAM_DESTROYED") {
-        console.error(`[ClawRouter] Response finished with error: ${err.message}`);
-      }
-      // Note: heartbeatInterval cleanup happens in res.on("close") handler
-      // Note: completed and dedup cleanup happens in the res.on("close") handler below
-    });
-
-    // Request finished wrapper for complete stream lifecycle tracking
-    finished(req, (err) => {
-      if (err && err.code !== "ERR_STREAM_DESTROYED") {
-        console.error(`[ClawRouter] Request finished with error: ${err.message}`);
-      }
-    });
-
-    // Health check with optional balance info
-    if (req.url === "/health" || req.url?.startsWith("/health?")) {
-      const url = new URL(req.url, "http://localhost");
-      const full = url.searchParams.get("full") === "true";
-
-      const response: Record<string, unknown> = {
-        status: "ok",
-        wallet: account.address,
-        paymentChain,
-      };
-      if (solanaAddress) {
-        response.solana = solanaAddress;
-      }
-
-      if (full) {
-        try {
-          const balanceInfo = await balanceMonitor.checkBalance();
-          response.balance = balanceInfo.balanceUSD;
-          response.isLow = balanceInfo.isLow;
-          response.isEmpty = balanceInfo.isEmpty;
-        } catch {
-          response.balanceError = "Could not fetch balance";
-        }
-      }
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(response));
-      return;
-    }
-
-    // Cache stats endpoint
-    if (req.url === "/cache" || req.url?.startsWith("/cache?")) {
-      const stats = responseCache.getStats();
-      res.writeHead(200, {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // Wrap in paymentStore.run() so x402 hook can write actual payment amount per-request
+    paymentStore.run({ amountUsd: 0 }, async () => {
+      // Add stream error handlers to prevent server crashes
+      req.on("error", (err) => {
+        console.error(`[ClawRouter] Request stream error: ${err.message}`);
+        // Don't throw - just log and let request handler deal with it
       });
-      res.end(JSON.stringify(stats, null, 2));
-      return;
-    }
 
-    // Stats clear endpoint - delete all log files
-    if (req.url === "/stats" && req.method === "DELETE") {
-      try {
-        const result = await clearStats();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ cleared: true, deletedFiles: result.deletedFiles }));
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: `Failed to clear stats: ${err instanceof Error ? err.message : String(err)}`,
-          }),
-        );
-      }
-      return;
-    }
+      res.on("error", (err) => {
+        console.error(`[ClawRouter] Response stream error: ${err.message}`);
+        // Don't try to write to failed socket - just log
+      });
 
-    // Stats API endpoint - returns JSON for programmatic access
-    if (req.url === "/stats" || req.url?.startsWith("/stats?")) {
-      try {
+      // Finished wrapper for guaranteed cleanup on response completion/error
+      finished(res, (err) => {
+        if (err && err.code !== "ERR_STREAM_DESTROYED") {
+          console.error(`[ClawRouter] Response finished with error: ${err.message}`);
+        }
+        // Note: heartbeatInterval cleanup happens in res.on("close") handler
+        // Note: completed and dedup cleanup happens in the res.on("close") handler below
+      });
+
+      // Request finished wrapper for complete stream lifecycle tracking
+      finished(req, (err) => {
+        if (err && err.code !== "ERR_STREAM_DESTROYED") {
+          console.error(`[ClawRouter] Request finished with error: ${err.message}`);
+        }
+      });
+
+      // Health check with optional balance info
+      if (req.url === "/health" || req.url?.startsWith("/health?")) {
         const url = new URL(req.url, "http://localhost");
-        const days = parseInt(url.searchParams.get("days") || "7", 10);
-        const stats = await getStats(Math.min(days, 30));
+        const full = url.searchParams.get("full") === "true";
 
+        const response: Record<string, unknown> = {
+          status: "ok",
+          wallet: account.address,
+          paymentChain,
+        };
+        if (solanaAddress) {
+          response.solana = solanaAddress;
+        }
+
+        if (full) {
+          try {
+            const balanceInfo = await balanceMonitor.checkBalance();
+            response.balance = balanceInfo.balanceUSD;
+            response.isLow = balanceInfo.isLow;
+            response.isEmpty = balanceInfo.isEmpty;
+          } catch {
+            response.balanceError = "Could not fetch balance";
+          }
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response));
+        return;
+      }
+
+      // Cache stats endpoint
+      if (req.url === "/cache" || req.url?.startsWith("/cache?")) {
+        const stats = responseCache.getStats();
         res.writeHead(200, {
           "Content-Type": "application/json",
           "Cache-Control": "no-cache",
         });
-        res.end(
-          JSON.stringify(
-            {
-              ...stats,
-              providerErrors: Object.fromEntries(perProviderErrors),
-            },
-            null,
-            2,
-          ),
-        );
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: `Failed to get stats: ${err instanceof Error ? err.message : String(err)}`,
-          }),
-        );
-      }
-      return;
-    }
-
-    // --- Handle /v1/models locally (no upstream call needed) ---
-    if (req.url === "/v1/models" && req.method === "GET") {
-      const models = buildProxyModelList();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ object: "list", data: models }));
-      return;
-    }
-
-    // --- Serve locally cached images (~/.openclaw/blockrun/images/) ---
-    if (req.url?.startsWith("/images/") && req.method === "GET") {
-      const filename = req.url
-        .slice("/images/".length)
-        .split("?")[0]!
-        .replace(/[^a-zA-Z0-9._-]/g, "");
-      if (!filename) {
-        res.writeHead(400);
-        res.end("Bad request");
+        res.end(JSON.stringify(stats, null, 2));
         return;
       }
-      const filePath = join(IMAGE_DIR, filename);
-      try {
-        const s = await fsStat(filePath);
-        if (!s.isFile()) throw new Error("not a file");
-        const ext = filename.split(".").pop()?.toLowerCase() ?? "png";
-        const mime: Record<string, string> = {
-          png: "image/png",
-          jpg: "image/jpeg",
-          jpeg: "image/jpeg",
-          webp: "image/webp",
-          gif: "image/gif",
-        };
-        const data = await readFile(filePath);
-        res.writeHead(200, {
-          "Content-Type": mime[ext] ?? "application/octet-stream",
-          "Content-Length": data.length,
-        });
-        res.end(data);
-      } catch {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Image not found" }));
-      }
-      return;
-    }
 
-    // --- Handle /v1/images/generations: proxy with x402 payment + save data URIs locally ---
-    // NOTE: image generation endpoints bypass maxCostPerRun budget tracking entirely.
-    // Cost is charged via x402 micropayment directly — no session accumulation or cap enforcement.
-    if (req.url === "/v1/images/generations" && req.method === "POST") {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      const reqBody = Buffer.concat(chunks);
-      try {
-        const upstream = await payFetch(`${apiBase}/v1/images/generations`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "user-agent": USER_AGENT },
-          body: reqBody,
-        });
-        const text = await upstream.text();
-        if (!upstream.ok) {
-          res.writeHead(upstream.status, { "Content-Type": "application/json" });
-          res.end(text);
-          return;
-        }
-        let result: { created?: number; data?: Array<{ url?: string; revised_prompt?: string }> };
+      // Stats clear endpoint - delete all log files
+      if (req.url === "/stats" && req.method === "DELETE") {
         try {
-          result = JSON.parse(text);
-        } catch {
+          const result = await clearStats();
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(text);
+          res.end(JSON.stringify({ cleared: true, deletedFiles: result.deletedFiles }));
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: `Failed to clear stats: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+          );
+        }
+        return;
+      }
+
+      // Stats API endpoint - returns JSON for programmatic access
+      if (req.url === "/stats" || req.url?.startsWith("/stats?")) {
+        try {
+          const url = new URL(req.url, "http://localhost");
+          const days = parseInt(url.searchParams.get("days") || "7", 10);
+          const stats = await getStats(Math.min(days, 30));
+
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+          });
+          res.end(
+            JSON.stringify(
+              {
+                ...stats,
+                providerErrors: Object.fromEntries(perProviderErrors),
+              },
+              null,
+              2,
+            ),
+          );
+        } catch (err) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: `Failed to get stats: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+          );
+        }
+        return;
+      }
+
+      // --- Handle /v1/models locally (no upstream call needed) ---
+      if (req.url === "/v1/models" && req.method === "GET") {
+        const models = buildProxyModelList();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ object: "list", data: models }));
+        return;
+      }
+
+      // --- Serve locally cached images (~/.openclaw/blockrun/images/) ---
+      if (req.url?.startsWith("/images/") && req.method === "GET") {
+        const filename = req.url
+          .slice("/images/".length)
+          .split("?")[0]!
+          .replace(/[^a-zA-Z0-9._-]/g, "");
+        if (!filename) {
+          res.writeHead(400);
+          res.end("Bad request");
           return;
         }
-        // Save images to ~/.openclaw/blockrun/images/ and replace with localhost URLs
-        // Handles both base64 data URIs (Google) and HTTP URLs (DALL-E 3)
-        if (result.data?.length) {
-          await mkdir(IMAGE_DIR, { recursive: true });
-          const port = (server.address() as AddressInfo | null)?.port ?? 8402;
-          for (const img of result.data) {
-            const dataUriMatch = img.url?.match(/^data:(image\/\w+);base64,(.+)$/);
-            if (dataUriMatch) {
-              const [, mimeType, b64] = dataUriMatch;
-              const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType!.split("/")[1] ?? "png");
-              const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-              await writeFile(join(IMAGE_DIR, filename), Buffer.from(b64!, "base64"));
-              img.url = `http://localhost:${port}/images/${filename}`;
-              console.log(`[ClawRouter] Image saved → ${img.url}`);
-            } else if (img.url?.startsWith("https://") || img.url?.startsWith("http://")) {
-              try {
-                const imgResp = await fetch(img.url);
-                if (imgResp.ok) {
-                  const contentType = imgResp.headers.get("content-type") ?? "image/png";
-                  const ext =
-                    contentType.includes("jpeg") || contentType.includes("jpg")
-                      ? "jpg"
-                      : contentType.includes("webp")
-                        ? "webp"
-                        : "png";
-                  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-                  const buf = Buffer.from(await imgResp.arrayBuffer());
-                  await writeFile(join(IMAGE_DIR, filename), buf);
-                  img.url = `http://localhost:${port}/images/${filename}`;
-                  console.log(`[ClawRouter] Image downloaded & saved → ${img.url}`);
+        const filePath = join(IMAGE_DIR, filename);
+        try {
+          const s = await fsStat(filePath);
+          if (!s.isFile()) throw new Error("not a file");
+          const ext = filename.split(".").pop()?.toLowerCase() ?? "png";
+          const mime: Record<string, string> = {
+            png: "image/png",
+            jpg: "image/jpeg",
+            jpeg: "image/jpeg",
+            webp: "image/webp",
+            gif: "image/gif",
+          };
+          const data = await readFile(filePath);
+          res.writeHead(200, {
+            "Content-Type": mime[ext] ?? "application/octet-stream",
+            "Content-Length": data.length,
+          });
+          res.end(data);
+        } catch {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Image not found" }));
+        }
+        return;
+      }
+
+      // --- Handle /v1/images/generations: proxy with x402 payment + save data URIs locally ---
+      // NOTE: image generation endpoints bypass maxCostPerRun budget tracking entirely.
+      // Cost is charged via x402 micropayment directly — no session accumulation or cap enforcement.
+      if (req.url === "/v1/images/generations" && req.method === "POST") {
+        const imgStartTime = Date.now();
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const reqBody = Buffer.concat(chunks);
+        // Parse request for usage logging
+        let imgModel = "unknown";
+        let imgCost = 0;
+        try {
+          const parsed = JSON.parse(reqBody.toString());
+          imgModel = parsed.model || "openai/dall-e-3";
+          const n = parsed.n || 1;
+          imgCost = estimateImageCost(imgModel, parsed.size, n);
+        } catch {
+          /* use defaults */
+        }
+        try {
+          const upstream = await payFetch(`${apiBase}/v1/images/generations`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": USER_AGENT },
+            body: reqBody,
+          });
+          const text = await upstream.text();
+          if (!upstream.ok) {
+            res.writeHead(upstream.status, { "Content-Type": "application/json" });
+            res.end(text);
+            return;
+          }
+          let result: { created?: number; data?: Array<{ url?: string; revised_prompt?: string }> };
+          try {
+            result = JSON.parse(text);
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(text);
+            return;
+          }
+          // Save images to ~/.openclaw/blockrun/images/ and replace with localhost URLs
+          // Handles both base64 data URIs (Google) and HTTP URLs (DALL-E 3)
+          if (result.data?.length) {
+            await mkdir(IMAGE_DIR, { recursive: true });
+            const port = (server.address() as AddressInfo | null)?.port ?? 8402;
+            for (const img of result.data) {
+              const dataUriMatch = img.url?.match(/^data:(image\/\w+);base64,(.+)$/);
+              if (dataUriMatch) {
+                const [, mimeType, b64] = dataUriMatch;
+                const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType!.split("/")[1] ?? "png");
+                const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+                await writeFile(join(IMAGE_DIR, filename), Buffer.from(b64!, "base64"));
+                img.url = `http://localhost:${port}/images/${filename}`;
+                console.log(`[ClawRouter] Image saved → ${img.url}`);
+              } else if (img.url?.startsWith("https://") || img.url?.startsWith("http://")) {
+                try {
+                  const imgResp = await fetch(img.url);
+                  if (imgResp.ok) {
+                    const contentType = imgResp.headers.get("content-type") ?? "image/png";
+                    const ext =
+                      contentType.includes("jpeg") || contentType.includes("jpg")
+                        ? "jpg"
+                        : contentType.includes("webp")
+                          ? "webp"
+                          : "png";
+                    const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+                    const buf = Buffer.from(await imgResp.arrayBuffer());
+                    await writeFile(join(IMAGE_DIR, filename), buf);
+                    img.url = `http://localhost:${port}/images/${filename}`;
+                    console.log(`[ClawRouter] Image downloaded & saved → ${img.url}`);
+                  }
+                } catch (downloadErr) {
+                  console.warn(
+                    `[ClawRouter] Failed to download image, using original URL: ${downloadErr instanceof Error ? downloadErr.message : String(downloadErr)}`,
+                  );
                 }
-              } catch (downloadErr) {
-                console.warn(
-                  `[ClawRouter] Failed to download image, using original URL: ${downloadErr instanceof Error ? downloadErr.message : String(downloadErr)}`,
-                );
               }
             }
           }
+          // Log image generation usage with actual x402 payment (previously missing entirely)
+          const imgActualCost = paymentStore.getStore()?.amountUsd ?? imgCost;
+          logUsage({
+            timestamp: new Date().toISOString(),
+            model: imgModel,
+            tier: "IMAGE",
+            cost: imgActualCost,
+            baselineCost: imgActualCost,
+            savings: 0,
+            latencyMs: Date.now() - imgStartTime,
+          }).catch(() => {});
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[ClawRouter] Image generation error: ${msg}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Image generation failed", details: msg }));
+          }
         }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[ClawRouter] Image generation error: ${msg}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Image generation failed", details: msg }));
+        return;
+      }
+
+      // --- Handle /v1/images/image2image: proxy with x402 payment + save images locally ---
+      // Accepts image as: data URI, local file path, ~/path, or HTTP(S) URL
+      if (req.url === "/v1/images/image2image" && req.method === "POST") {
+        const img2imgStartTime = Date.now();
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         }
-      }
-      return;
-    }
+        const rawBody = Buffer.concat(chunks);
 
-    // --- Handle /v1/images/image2image: proxy with x402 payment + save images locally ---
-    // Accepts image as: data URI, local file path, ~/path, or HTTP(S) URL
-    if (req.url === "/v1/images/image2image" && req.method === "POST") {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      const rawBody = Buffer.concat(chunks);
+        // Resolve image/mask fields: file paths and URLs → data URIs
+        let reqBody: string;
+        // eslint-disable-next-line no-useless-assignment -- reassigned in try, used after catch
+        let img2imgModel = "openai/gpt-image-1";
+        // eslint-disable-next-line no-useless-assignment -- reassigned in try, used after catch
+        let img2imgCost = 0;
+        try {
+          const parsed = JSON.parse(rawBody.toString());
+          for (const field of ["image", "mask"] as const) {
+            const val = parsed[field];
+            if (typeof val !== "string" || !val) continue;
+            if (val.startsWith("data:")) {
+              // Already a data URI — pass through
+            } else if (val.startsWith("https://") || val.startsWith("http://")) {
+              // Download URL → data URI
+              const imgResp = await fetch(val);
+              if (!imgResp.ok)
+                throw new Error(`Failed to download ${field} from ${val}: HTTP ${imgResp.status}`);
+              const contentType = imgResp.headers.get("content-type") ?? "image/png";
+              const buf = Buffer.from(await imgResp.arrayBuffer());
+              parsed[field] = `data:${contentType};base64,${buf.toString("base64")}`;
+              console.log(
+                `[ClawRouter] img2img: downloaded ${field} URL → data URI (${buf.length} bytes)`,
+              );
+            } else {
+              // Local file path → data URI
+              parsed[field] = readImageFileAsDataUri(val);
+              console.log(`[ClawRouter] img2img: read ${field} file → data URI`);
+            }
+          }
+          // Default model if not specified
+          if (!parsed.model) parsed.model = "openai/gpt-image-1";
+          img2imgModel = parsed.model;
+          img2imgCost = estimateImageCost(img2imgModel, parsed.size, parsed.n || 1);
+          reqBody = JSON.stringify(parsed);
+        } catch (parseErr) {
+          const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid request", details: msg }));
+          return;
+        }
 
-      // Resolve image/mask fields: file paths and URLs → data URIs
-      let reqBody: string;
-      try {
-        const parsed = JSON.parse(rawBody.toString());
-        for (const field of ["image", "mask"] as const) {
-          const val = parsed[field];
-          if (typeof val !== "string" || !val) continue;
-          if (val.startsWith("data:")) {
-            // Already a data URI — pass through
-          } else if (val.startsWith("https://") || val.startsWith("http://")) {
-            // Download URL → data URI
-            const imgResp = await fetch(val);
-            if (!imgResp.ok)
-              throw new Error(`Failed to download ${field} from ${val}: HTTP ${imgResp.status}`);
-            const contentType = imgResp.headers.get("content-type") ?? "image/png";
-            const buf = Buffer.from(await imgResp.arrayBuffer());
-            parsed[field] = `data:${contentType};base64,${buf.toString("base64")}`;
-            console.log(
-              `[ClawRouter] img2img: downloaded ${field} URL → data URI (${buf.length} bytes)`,
+        try {
+          const upstream = await payFetch(`${apiBase}/v1/images/image2image`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": USER_AGENT },
+            body: reqBody,
+          });
+          const text = await upstream.text();
+          if (!upstream.ok) {
+            res.writeHead(upstream.status, { "Content-Type": "application/json" });
+            res.end(text);
+            return;
+          }
+          let result: { created?: number; data?: Array<{ url?: string; revised_prompt?: string }> };
+          try {
+            result = JSON.parse(text);
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(text);
+            return;
+          }
+          // Save images to ~/.openclaw/blockrun/images/ and replace with localhost URLs
+          // Handles both base64 data URIs (Google) and HTTP URLs (DALL-E 3)
+          if (result.data?.length) {
+            await mkdir(IMAGE_DIR, { recursive: true });
+            const port = (server.address() as AddressInfo | null)?.port ?? 8402;
+            for (const img of result.data) {
+              const dataUriMatch = img.url?.match(/^data:(image\/\w+);base64,(.+)$/);
+              if (dataUriMatch) {
+                const [, mimeType, b64] = dataUriMatch;
+                const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType!.split("/")[1] ?? "png");
+                const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+                await writeFile(join(IMAGE_DIR, filename), Buffer.from(b64!, "base64"));
+                img.url = `http://localhost:${port}/images/${filename}`;
+                console.log(`[ClawRouter] Image saved → ${img.url}`);
+              } else if (img.url?.startsWith("https://") || img.url?.startsWith("http://")) {
+                try {
+                  const imgResp = await fetch(img.url);
+                  if (imgResp.ok) {
+                    const contentType = imgResp.headers.get("content-type") ?? "image/png";
+                    const ext =
+                      contentType.includes("jpeg") || contentType.includes("jpg")
+                        ? "jpg"
+                        : contentType.includes("webp")
+                          ? "webp"
+                          : "png";
+                    const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+                    const buf = Buffer.from(await imgResp.arrayBuffer());
+                    await writeFile(join(IMAGE_DIR, filename), buf);
+                    img.url = `http://localhost:${port}/images/${filename}`;
+                    console.log(`[ClawRouter] Image downloaded & saved → ${img.url}`);
+                  }
+                } catch (downloadErr) {
+                  console.warn(
+                    `[ClawRouter] Failed to download image, using original URL: ${downloadErr instanceof Error ? downloadErr.message : String(downloadErr)}`,
+                  );
+                }
+              }
+            }
+          }
+          // Log image editing usage with actual x402 payment (previously missing entirely)
+          const img2imgActualCost = paymentStore.getStore()?.amountUsd ?? img2imgCost;
+          logUsage({
+            timestamp: new Date().toISOString(),
+            model: img2imgModel,
+            tier: "IMAGE",
+            cost: img2imgActualCost,
+            baselineCost: img2imgActualCost,
+            savings: 0,
+            latencyMs: Date.now() - img2imgStartTime,
+          }).catch(() => {});
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[ClawRouter] Image editing error: ${msg}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Image editing failed", details: msg }));
+          }
+        }
+        return;
+      }
+
+      // --- Handle partner API paths (/v1/x/*, /v1/partner/*, /v1/pm/*) ---
+      if (req.url?.match(/^\/v1\/(?:x|partner|pm)\//)) {
+        try {
+          await proxyPartnerRequest(
+            req,
+            res,
+            apiBase,
+            payFetch,
+            () => paymentStore.getStore()?.amountUsd ?? 0,
+          );
+        } catch (err) {
+          const error = err instanceof Error ? err : new Error(String(err));
+          options.onError?.(error);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: { message: `Partner proxy error: ${error.message}`, type: "partner_error" },
+              }),
             );
-          } else {
-            // Local file path → data URI
-            parsed[field] = readImageFileAsDataUri(val);
-            console.log(`[ClawRouter] img2img: read ${field} file → data URI`);
           }
         }
-        // Default model if not specified
-        if (!parsed.model) parsed.model = "openai/gpt-image-1";
-        reqBody = JSON.stringify(parsed);
-      } catch (parseErr) {
-        const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid request", details: msg }));
+        return;
+      }
+
+      // Only proxy paths starting with /v1
+      if (!req.url?.startsWith("/v1")) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Not found" }));
         return;
       }
 
       try {
-        const upstream = await payFetch(`${apiBase}/v1/images/image2image`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "user-agent": USER_AGENT },
-          body: reqBody,
-        });
-        const text = await upstream.text();
-        if (!upstream.ok) {
-          res.writeHead(upstream.status, { "Content-Type": "application/json" });
-          res.end(text);
-          return;
-        }
-        let result: { created?: number; data?: Array<{ url?: string; revised_prompt?: string }> };
-        try {
-          result = JSON.parse(text);
-        } catch {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(text);
-          return;
-        }
-        // Save images to ~/.openclaw/blockrun/images/ and replace with localhost URLs
-        // Handles both base64 data URIs (Google) and HTTP URLs (DALL-E 3)
-        if (result.data?.length) {
-          await mkdir(IMAGE_DIR, { recursive: true });
-          const port = (server.address() as AddressInfo | null)?.port ?? 8402;
-          for (const img of result.data) {
-            const dataUriMatch = img.url?.match(/^data:(image\/\w+);base64,(.+)$/);
-            if (dataUriMatch) {
-              const [, mimeType, b64] = dataUriMatch;
-              const ext = mimeType === "image/jpeg" ? "jpg" : (mimeType!.split("/")[1] ?? "png");
-              const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-              await writeFile(join(IMAGE_DIR, filename), Buffer.from(b64!, "base64"));
-              img.url = `http://localhost:${port}/images/${filename}`;
-              console.log(`[ClawRouter] Image saved → ${img.url}`);
-            } else if (img.url?.startsWith("https://") || img.url?.startsWith("http://")) {
-              try {
-                const imgResp = await fetch(img.url);
-                if (imgResp.ok) {
-                  const contentType = imgResp.headers.get("content-type") ?? "image/png";
-                  const ext =
-                    contentType.includes("jpeg") || contentType.includes("jpg")
-                      ? "jpg"
-                      : contentType.includes("webp")
-                        ? "webp"
-                        : "png";
-                  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
-                  const buf = Buffer.from(await imgResp.arrayBuffer());
-                  await writeFile(join(IMAGE_DIR, filename), buf);
-                  img.url = `http://localhost:${port}/images/${filename}`;
-                  console.log(`[ClawRouter] Image downloaded & saved → ${img.url}`);
-                }
-              } catch (downloadErr) {
-                console.warn(
-                  `[ClawRouter] Failed to download image, using original URL: ${downloadErr instanceof Error ? downloadErr.message : String(downloadErr)}`,
-                );
-              }
-            }
-          }
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[ClawRouter] Image editing error: ${msg}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Image editing failed", details: msg }));
-        }
-      }
-      return;
-    }
-
-    // --- Handle partner API paths (/v1/x/*, /v1/partner/*) ---
-    if (req.url?.match(/^\/v1\/(?:x|partner)\//)) {
-      try {
-        await proxyPartnerRequest(req, res, apiBase, payFetch);
+        await proxyRequest(
+          req,
+          res,
+          apiBase,
+          payFetch,
+          options,
+          routerOpts,
+          deduplicator,
+          balanceMonitor,
+          sessionStore,
+          responseCache,
+          sessionJournal,
+        );
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         options.onError?.(error);
+
         if (!res.headersSent) {
           res.writeHead(502, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
-              error: { message: `Partner proxy error: ${error.message}`, type: "partner_error" },
+              error: { message: `Proxy error: ${error.message}`, type: "proxy_error" },
             }),
           );
+        } else if (!res.writableEnded) {
+          // Headers already sent (streaming) — send error as SSE event
+          res.write(
+            `data: ${JSON.stringify({ error: { message: error.message, type: "proxy_error" } })}\n\n`,
+          );
+          res.write("data: [DONE]\n\n");
+          res.end();
         }
       }
-      return;
-    }
-
-    // Only proxy paths starting with /v1
-    if (!req.url?.startsWith("/v1")) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found" }));
-      return;
-    }
-
-    try {
-      await proxyRequest(
-        req,
-        res,
-        apiBase,
-        payFetch,
-        options,
-        routerOpts,
-        deduplicator,
-        balanceMonitor,
-        sessionStore,
-        responseCache,
-        sessionJournal,
-      );
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      options.onError?.(error);
-
-      if (!res.headersSent) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: { message: `Proxy error: ${error.message}`, type: "proxy_error" },
-          }),
-        );
-      } else if (!res.writableEnded) {
-        // Headers already sent (streaming) — send error as SSE event
-        res.write(
-          `data: ${JSON.stringify({ error: { message: error.message, type: "proxy_error" } })}\n\n`,
-        );
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }
-    }
+    }); // end paymentStore.run()
   });
 
   // Listen on configured port with retry logic for TIME_WAIT handling
@@ -2221,7 +2326,7 @@ async function tryModelRequest(
   let requestBody = body;
   try {
     const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
-    parsed.model = modelId;
+    parsed.model = toUpstreamModelId(modelId);
 
     // Normalize message roles (e.g., "developer" -> "system")
     if (Array.isArray(parsed.messages)) {
@@ -2250,7 +2355,7 @@ async function tryModelRequest(
       parsed.messages = normalizeMessagesForGoogle(parsed.messages as ChatMessage[]);
     }
 
-    // Normalize messages for thinking-enabled requests (add reasoning_content to tool calls)
+    // Normalize messages for thinking-enabled requests (add reasoning_content to all assistant messages)
     // Check request flags AND target model - reasoning models have thinking enabled server-side
     const hasThinkingEnabled = !!(
       parsed.thinking ||
@@ -2372,13 +2477,14 @@ async function proxyRequest(
   let isStreaming = false;
   let modelId = "";
   let maxTokens = 4096;
-  let routingProfile: "free" | "eco" | "auto" | "premium" | null = null;
+  let routingProfile: "eco" | "auto" | "premium" | null = null;
   let balanceFallbackNotice: string | undefined;
   let budgetDowngradeNotice: string | undefined;
   let budgetDowngradeHeaderMode: "downgraded" | undefined;
   let accumulatedContent = ""; // For session journal event extraction
   let responseInputTokens: number | undefined;
   let responseOutputTokens: number | undefined;
+  let requestHadError = false; // Set to true when all models fail → used in logUsage
   const isChatCompletion = req.url?.includes("/chat/completions");
 
   // Extract session ID early for journal operations (header-only at this point)
@@ -2455,8 +2561,8 @@ async function proxyRequest(
           typeof parsed.model === "string" ? parsed.model.trim().toLowerCase() : "";
         const profileName = normalizedModel.replace("blockrun/", "");
         const debugProfile = (
-          ["free", "eco", "auto", "premium"].includes(profileName) ? profileName : "auto"
-        ) as "free" | "eco" | "auto" | "premium";
+          ["eco", "auto", "premium"].includes(profileName) ? profileName : "auto"
+        ) as "eco" | "auto" | "premium";
 
         // Run scoring
         const scoring = classifyByRules(
@@ -2726,6 +2832,18 @@ async function proxyRequest(
               responseText = lines.join("\n");
             }
             console.log(`[ClawRouter] /imagegen success: ${images.length} image(s) generated`);
+            // Log /imagegen usage with actual x402 payment
+            const imagegenActualCost =
+              paymentStore.getStore()?.amountUsd ?? estimateImageCost(imageModel, imageSize, 1);
+            logUsage({
+              timestamp: new Date().toISOString(),
+              model: imageModel,
+              tier: "IMAGE",
+              cost: imagegenActualCost,
+              baselineCost: imagegenActualCost,
+              savings: 0,
+              latencyMs: 0,
+            }).catch(() => {});
           }
 
           // Return as synthetic chat completion
@@ -2953,6 +3071,18 @@ async function proxyRequest(
               responseText = lines.join("\n");
             }
             console.log(`[ClawRouter] /img2img success: ${images.length} image(s)`);
+            // Log /img2img usage with actual x402 payment
+            const img2imgActualCost2 =
+              paymentStore.getStore()?.amountUsd ?? estimateImageCost(img2imgModel, img2imgSize, 1);
+            logUsage({
+              timestamp: new Date().toISOString(),
+              model: img2imgModel,
+              tier: "IMAGE",
+              cost: img2imgActualCost2,
+              baselineCost: img2imgActualCost2,
+              savings: 0,
+              latencyMs: 0,
+            }).catch(() => {});
           }
 
           sendImg2ImgText(responseText);
@@ -2994,7 +3124,7 @@ async function proxyRequest(
       // Extract routing profile type (free/eco/auto/premium)
       if (isRoutingProfile) {
         const profileName = resolvedModel.replace("blockrun/", "");
-        routingProfile = profileName as "free" | "eco" | "auto" | "premium";
+        routingProfile = profileName as "eco" | "auto" | "premium";
       }
 
       // Debug: log received model name
@@ -3014,34 +3144,7 @@ async function proxyRequest(
 
       // Handle routing profiles (free/eco/auto/premium)
       if (isRoutingProfile) {
-        // Free profile - direct shortcut to nvidia/gpt-oss-120b (no tier routing)
-        if (routingProfile === "free") {
-          const freeModel = "nvidia/gpt-oss-120b";
-          console.log(`[ClawRouter] Free profile - using ${freeModel} directly`);
-          parsed.model = freeModel;
-          modelId = freeModel;
-          bodyModified = true;
-
-          // Nudge every 5th free request toward paid models
-          freeRequestCount++;
-          if (freeRequestCount % 5 === 0) {
-            balanceFallbackNotice = `> **💡 Tip:** Not satisfied with free model quality? Fund your wallet to unlock deepseek-chat, gemini-flash, and 30+ premium models — starting at $0.001/request.\n\n`;
-          }
-
-          // Set routing decision so end-of-request logging uses correct tier
-          // (no early logUsage here — the request will be logged after upstream call)
-          routingDecision = {
-            model: freeModel,
-            tier: "SIMPLE" as Tier,
-            confidence: 1,
-            method: "rules",
-            reasoning: "free profile",
-            costEstimate: 0,
-            baselineCost: 0,
-            savings: 1,
-            tierConfigs: FREE_TIER_CONFIGS,
-          };
-        } else {
+        {
           // eco/auto/premium - use tier routing
           // Check for session persistence - use pinned model if available
           // Fall back to deriving a session ID from message content when OpenClaw
@@ -3226,8 +3329,11 @@ async function proxyRequest(
         effectiveSessionId = deriveSessionId(parsedMessages);
       }
 
-      // Rebuild body if modified
+      // Rebuild body if modified — map free/xxx → nvidia/xxx for upstream
       if (bodyModified) {
+        if (parsed.model && typeof parsed.model === "string") {
+          parsed.model = toUpstreamModelId(parsed.model);
+        }
         body = Buffer.from(JSON.stringify(parsed));
       }
     } catch (err) {
@@ -3340,8 +3446,8 @@ async function proxyRequest(
   // Estimate cost and check if wallet has sufficient balance
   // Skip if skipBalanceCheck is set (for testing) or if using free model
   let estimatedCostMicros: bigint | undefined;
-  // Use `let` so the balance-fallback path can update this when modelId is switched to FREE_MODEL.
-  let isFreeModel = modelId === FREE_MODEL;
+  // Use `let` so the balance-fallback path can update this when modelId is switched to a free model.
+  let isFreeModel = FREE_MODELS.has(modelId ?? "");
 
   if (modelId && !options.skipBalanceCheck && !isFreeModel) {
     const estimated = estimateAmount(modelId, body.length, maxTokens);
@@ -3357,29 +3463,22 @@ async function proxyRequest(
       const sufficiency = await balanceMonitor.checkSufficient(bufferedCostMicros);
 
       if (sufficiency.info.isEmpty || !sufficiency.sufficient) {
-        // Wallet is empty or insufficient — ALWAYS fallback to free model
-        // This ensures new users with empty wallets can still use ClawRouter
+        // Wallet is empty or insufficient — fallback to free model
         const originalModel = modelId;
         console.log(
           `[ClawRouter] Wallet ${sufficiency.info.isEmpty ? "empty" : "insufficient"} (${sufficiency.info.balanceUSD}), falling back to free model: ${FREE_MODEL} (requested: ${originalModel})`,
         );
         modelId = FREE_MODEL;
         isFreeModel = true; // keep in sync — budget logic gates on !isFreeModel
-        // Update the body with new model
+        // Update the body with new model (map free/ → nvidia/ for upstream)
         const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
-        parsed.model = FREE_MODEL;
+        parsed.model = toUpstreamModelId(FREE_MODEL);
         body = Buffer.from(JSON.stringify(parsed));
 
         // Set notice to prepend to response so user knows about the fallback
         balanceFallbackNotice = sufficiency.info.isEmpty
           ? `> **⚠️ Wallet empty** — using free model. Fund your wallet to use ${originalModel}.\n\n`
           : `> **⚠️ Insufficient balance** (${sufficiency.info.balanceUSD}) — using free model instead of ${originalModel}.\n\n`;
-
-        // Also count balance-fallback as a free request for upgrade nudge
-        freeRequestCount++;
-        if (freeRequestCount % 5 === 0) {
-          balanceFallbackNotice = `> **💡 Tip:** Not satisfied with free model quality? Fund your wallet to unlock deepseek-chat, gemini-flash, and 30+ premium models — starting at $0.001/request.\n\n`;
-        }
 
         // Notify about the fallback
         options.onLowBalance?.({
@@ -3414,7 +3513,9 @@ async function proxyRequest(
     const thisReqEstStr =
       estimatedCostMicros !== undefined
         ? estimatedCostMicros.toString()
-        : (modelId ? estimateAmount(modelId, body.length, maxTokens) : undefined);
+        : modelId
+          ? estimateAmount(modelId, body.length, maxTokens)
+          : undefined;
     const thisReqEstUsd = thisReqEstStr ? Number(thisReqEstStr) / 1_000_000 : 0;
     const projectedCostUsd = runCostUsd + thisReqEstUsd;
     if (projectedCostUsd > options.maxCostPerRunUsd) {
@@ -3456,15 +3557,13 @@ async function proxyRequest(
     const remainingUsd = options.maxCostPerRunUsd - runCostUsd;
 
     const isComplexOrAgentic =
-      hasTools ||
-      routingDecision?.tier === "COMPLEX" ||
-      routingDecision?.tier === "REASONING";
+      hasTools || routingDecision?.tier === "COMPLEX" || routingDecision?.tier === "REASONING";
 
     if (isComplexOrAgentic) {
       // Case A: tool/complex/agentic routing profile — check global model table
-      // Intentionally exclude FREE_MODEL: free model cannot handle complex/agentic tasks.
+      // Intentionally exclude free models: they cannot handle complex/agentic tasks.
       const canAffordAnyNonFreeModel = BLOCKRUN_MODELS.some((m) => {
-        if (m.id === FREE_MODEL) return false;
+        if (FREE_MODELS.has(m.id)) return false;
         const est = estimateAmount(m.id, body.length, maxTokens);
         return est !== undefined && Number(est) / 1_000_000 <= remainingUsd;
       });
@@ -3489,7 +3588,7 @@ async function proxyRequest(
         deduplicator.removeInflight(dedupKey);
         return;
       }
-    } else if (!routingDecision && modelId && modelId !== FREE_MODEL) {
+    } else if (!routingDecision && modelId && !FREE_MODELS.has(modelId)) {
       // Case B: explicit model request (user chose a specific model, not a routing profile).
       // Silently substituting their choice with free model is deceptive — block instead.
       const est = estimateAmount(modelId, body.length, maxTokens);
@@ -3594,6 +3693,7 @@ async function proxyRequest(
     // If we have a routing decision, get the full fallback chain for the tier
     // Otherwise, just use the current model (no fallback for explicit model requests)
     let modelsToTry: string[];
+    const excludeList = options.excludeModels ?? loadExcludeList();
     if (routingDecision) {
       // Estimate total context: input tokens (~4 chars per token) + max output tokens
       const estimatedInputTokens = Math.ceil(body.length / 4);
@@ -3619,11 +3719,20 @@ async function proxyRequest(
         );
       }
 
+      // Filter out user-excluded models
+      const excludeFiltered = filterByExcludeList(contextFiltered, excludeList);
+      const excludeExcluded = contextFiltered.filter((m) => !excludeFiltered.includes(m));
+      if (excludeExcluded.length > 0) {
+        console.log(
+          `[ClawRouter] Exclude filter: excluded ${excludeExcluded.join(", ")} (user preference)`,
+        );
+      }
+
       // Filter to models that support tool calling when request has tools.
       // Prevents models like grok-code-fast-1 from outputting tool invocations
       // as plain text JSON (the "talking to itself" bug).
-      let toolFiltered = filterByToolCalling(contextFiltered, hasTools, supportsToolCalling);
-      const toolExcluded = contextFiltered.filter((m) => !toolFiltered.includes(m));
+      let toolFiltered = filterByToolCalling(excludeFiltered, hasTools, supportsToolCalling);
+      const toolExcluded = excludeFiltered.filter((m) => !toolFiltered.includes(m));
       if (toolExcluded.length > 0) {
         console.log(
           `[ClawRouter] Tool-calling filter: excluded ${toolExcluded.join(", ")} (no structured function call support)`,
@@ -3671,8 +3780,8 @@ async function proxyRequest(
     // Ensure free model is the last-resort fallback for non-tool requests.
     // Skip free fallback when tools are present — nvidia/gpt-oss-120b lacks
     // tool calling support and would produce broken responses for agentic tasks.
-    if (!hasTools && !modelsToTry.includes(FREE_MODEL)) {
-      modelsToTry.push(FREE_MODEL);
+    if (!hasTools && !modelsToTry.includes(FREE_MODEL) && !excludeList.has(FREE_MODEL)) {
+      modelsToTry.push(FREE_MODEL); // last-resort free fallback
     }
 
     // --- Budget-aware routing (graceful mode) ---
@@ -3690,7 +3799,7 @@ async function proxyRequest(
 
       const beforeFilter = [...modelsToTry];
       modelsToTry = modelsToTry.filter((m) => {
-        if (m === FREE_MODEL) return true; // free model always fits
+        if (FREE_MODELS.has(m)) return true; // free models always fit (no cost)
         const est = estimateAmount(m, body.length, maxTokens);
         if (!est) return true; // no pricing data → keep (permissive)
         return Number(est) / 1_000_000 <= remainingUsd;
@@ -3700,7 +3809,7 @@ async function proxyRequest(
 
       // Second-pass block: the pre-check caught obvious cases early (before streaming headers).
       // Here we recheck against the actual filtered modelsToTry chain. If the ONLY remaining
-      // model is FREE_MODEL, we must block rather than silently degrade for:
+      // models are free, we must block rather than silently degrade for:
       //   (A) complex/agentic routing profile tasks (tools / COMPLEX / REASONING tier)
       //   (B) explicit model requests (user chose a specific model; free substitution is deceptive)
       // The pre-check already handles case (B) for non-streaming; this is a safety net for
@@ -3711,7 +3820,7 @@ async function proxyRequest(
         routingDecision?.tier === "REASONING" ||
         routingDecision === undefined; // explicit model: no routing profile → user chose the model
       const filteredToFreeOnly =
-        modelsToTry.length > 0 && modelsToTry.every((m) => m === FREE_MODEL);
+        modelsToTry.length > 0 && modelsToTry.every((m) => FREE_MODELS.has(m));
 
       if (isComplexOrAgenticFilter && filteredToFreeOnly) {
         const budgetSummary = `$${Math.max(0, remainingUsd).toFixed(4)} remaining (limit: $${options.maxCostPerRunUsd})`;
@@ -3753,11 +3862,11 @@ async function proxyRequest(
 
         // A: Set visible warning notice — prepended to response so user sees the downgrade
         const fromModel = excluded[0];
-        const usingFree = modelsToTry.length === 1 && modelsToTry[0] === FREE_MODEL;
+        const usingFree = modelsToTry.length === 1 && FREE_MODELS.has(modelsToTry[0]);
         if (usingFree) {
           budgetDowngradeNotice = `> **⚠️ Budget cap reached** ($${runCostUsd.toFixed(4)}/$${options.maxCostPerRunUsd}) — downgraded to free model. Quality may be reduced. Increase \`maxCostPerRun\` to continue with ${fromModel}.\n\n`;
         } else {
-          const toModel = modelsToTry[0] ?? FREE_MODEL;
+          const toModel = modelsToTry[0] ?? FREE_MODEL; // last resort
           budgetDowngradeNotice = `> **⚠️ Budget low** ($${remainingUsd > 0 ? remainingUsd.toFixed(4) : "0.0000"} remaining) — using ${toModel} instead of ${fromModel}.\n\n`;
         }
         // B: Header flag for orchestration layers (e.g. OpenClaw can pause/warn the user)
@@ -3769,6 +3878,7 @@ async function proxyRequest(
     let upstream: Response | undefined;
     let lastError: { body: string; status: number } | undefined;
     let actualModelUsed = modelId;
+    const failedAttempts: Array<{ model: string; reason: string; status: number }> = [];
 
     for (let i = 0; i < modelsToTry.length; i++) {
       const tryModel = modelsToTry[i];
@@ -3819,7 +3929,7 @@ async function proxyRequest(
         actualModelUsed = tryModel;
         console.log(`[ClawRouter] Success with model: ${tryModel}`);
         // Accumulate estimated cost to session for maxCostPerRun tracking
-        if (options.maxCostPerRunUsd && effectiveSessionId && tryModel !== FREE_MODEL) {
+        if (options.maxCostPerRunUsd && effectiveSessionId && !FREE_MODELS.has(tryModel)) {
           const costEst = estimateAmount(tryModel, body.length, maxTokens);
           if (costEst) {
             sessionStore.addSessionCost(effectiveSessionId, BigInt(costEst));
@@ -3833,6 +3943,40 @@ async function proxyRequest(
         body: result.errorBody || "Unknown error",
         status: result.errorStatus || 500,
       };
+      failedAttempts.push({
+        model: tryModel,
+        reason: result.errorCategory || `HTTP ${result.errorStatus || 500}`,
+        status: result.errorStatus || 500,
+      });
+
+      // Payment error (insufficient funds, simulation failure) — skip remaining
+      // paid models, jump straight to free model. No point trying other paid
+      // models with the same wallet state.
+      // Must be checked BEFORE isProviderError gate: payment settlement failures
+      // may return non-standard HTTP codes that categorizeError doesn't recognize,
+      // causing isProviderError=false and breaking out of the fallback loop.
+      const isPaymentErr =
+        /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
+          result.errorBody || "",
+        );
+      if (isPaymentErr && !FREE_MODELS.has(tryModel) && !isLastAttempt) {
+        failedAttempts.push({
+          ...failedAttempts[failedAttempts.length - 1],
+          reason: "payment_error",
+        });
+        const freeIdx = modelsToTry.indexOf(FREE_MODEL);
+        if (freeIdx > i + 1) {
+          console.log(`[ClawRouter] Payment error — skipping to free model: ${FREE_MODEL}`);
+          i = freeIdx - 1; // loop will increment to freeIdx
+          continue;
+        }
+        // Free model not in chain — add it and try
+        if (freeIdx === -1) {
+          modelsToTry.push(FREE_MODEL);
+          console.log(`[ClawRouter] Payment error — appending free model: ${FREE_MODEL}`);
+          continue;
+        }
+      }
 
       // If it's a provider error and not the last attempt, try next model
       if (result.isProviderError && !isLastAttempt) {
@@ -3923,22 +4067,6 @@ async function proxyRequest(
           );
         }
 
-        // Payment error (insufficient funds, simulation failure) — skip remaining
-        // paid models, jump straight to free model. No point trying other paid
-        // models with the same wallet state.
-        const isPaymentErr =
-          /payment.*verification.*failed|payment.*settlement.*failed|insufficient.*funds|transaction_simulation_failed/i.test(
-            result.errorBody || "",
-          );
-        if (isPaymentErr && tryModel !== FREE_MODEL) {
-          const freeIdx = modelsToTry.indexOf(FREE_MODEL);
-          if (freeIdx > i + 1) {
-            console.log(`[ClawRouter] Payment error — skipping to free model: ${FREE_MODEL}`);
-            i = freeIdx - 1; // loop will increment to freeIdx
-            continue;
-          }
-        }
-
         console.log(
           `[ClawRouter] Provider error from ${tryModel}, trying fallback: ${result.errorBody?.slice(0, 100)}`,
         );
@@ -4005,19 +4133,43 @@ async function proxyRequest(
 
     // --- Handle case where all models failed ---
     if (!upstream) {
-      const rawErrBody = lastError?.body || "All models in fallback chain failed";
+      // Build structured error summary listing all attempted models
+      const attemptSummary =
+        failedAttempts.length > 0
+          ? failedAttempts.map((a) => `${a.model} (${a.reason})`).join(", ")
+          : "unknown";
+      const structuredMessage =
+        failedAttempts.length > 0
+          ? `All ${failedAttempts.length} models failed. Tried: ${attemptSummary}`
+          : "All models in fallback chain failed";
+      console.log(`[ClawRouter] ${structuredMessage}`);
+      const rawErrBody = lastError?.body || structuredMessage;
       const errStatus = lastError?.status || 502;
 
       // Transform payment errors into user-friendly messages
       const transformedErr = transformPaymentError(rawErrBody);
 
+      // Mark as error for usage logging (logs this failed attempt with cost)
+      requestHadError = true;
+
       if (headersSentEarly) {
-        // Streaming: send error as SSE event
-        // If transformed error is already JSON, parse and use it; otherwise wrap in standard format
+        // Streaming: send error as SSE event in OpenAI error format.
+        // The OpenAI SDK (used by continue.dev and others) expects {"error": {...}}.
+        // If the upstream error is already in that shape, use it; otherwise wrap it.
+        // Sending raw upstream JSON (e.g. {"code":400,"message":"..."}) causes the SDK
+        // to throw a generic "Unexpected error" instead of a meaningful message.
         let errPayload: string;
         try {
           const parsed = JSON.parse(transformedErr);
-          errPayload = JSON.stringify(parsed);
+          if (parsed && typeof parsed === "object" && "error" in parsed) {
+            // Already has the correct {"error": {...}} wrapper — use as-is
+            errPayload = JSON.stringify(parsed);
+          } else {
+            // Raw upstream JSON without error wrapper — wrap it
+            errPayload = JSON.stringify({
+              error: { message: rawErrBody, type: "provider_error", status: errStatus },
+            });
+          }
         } catch {
           errPayload = JSON.stringify({
             error: { message: rawErrBody, type: "provider_error", status: errStatus },
@@ -4050,6 +4202,23 @@ async function proxyRequest(
           body: Buffer.from(transformedErr),
           completedAt: Date.now(),
         });
+      }
+
+      // Log failed request so users can see it in `clawrouter logs`
+      // cost = actual x402 payment if any was made, otherwise 0
+      const errModel = routingDecision?.model ?? modelId;
+      if (errModel) {
+        const errPayment = paymentStore.getStore()?.amountUsd ?? 0;
+        logUsage({
+          timestamp: new Date().toISOString(),
+          model: errModel,
+          tier: routingDecision?.tier ?? "DIRECT",
+          cost: errPayment,
+          baselineCost: errPayment,
+          savings: 0,
+          latencyMs: Date.now() - startTime,
+          status: "error",
+        }).catch(() => {});
       }
       return;
     }
@@ -4115,7 +4284,7 @@ async function proxyRequest(
             id: rsp.id ?? `chatcmpl-${Date.now()}`,
             object: "chat.completion.chunk",
             created: rsp.created ?? Math.floor(Date.now() / 1000),
-            model: rsp.model ?? "unknown",
+            model: actualModelUsed || rsp.model || "unknown",
             system_fingerprint: null,
           };
 
@@ -4238,6 +4407,13 @@ async function proxyRequest(
         }
       }
 
+      // Send cost summary as SSE comment before terminator
+      if (routingDecision) {
+        const costComment = `: cost=$${routingDecision.costEstimate.toFixed(4)} savings=${(routingDecision.savings * 100).toFixed(0)}% model=${actualModelUsed} tier=${routingDecision.tier}\n\n`;
+        safeWrite(res, costComment);
+        responseChunks.push(Buffer.from(costComment));
+      }
+
       // Send SSE terminator
       safeWrite(res, "data: [DONE]\n\n");
       responseChunks.push(Buffer.from("data: [DONE]\n\n"));
@@ -4276,6 +4452,12 @@ async function proxyRequest(
         }
       }
 
+      // Always include cost visibility headers when routing is active
+      if (routingDecision) {
+        responseHeaders["x-clawrouter-cost"] = routingDecision.costEstimate.toFixed(6);
+        responseHeaders["x-clawrouter-savings"] = `${(routingDecision.savings * 100).toFixed(0)}%`;
+      }
+
       // Collect full body for possible notice injection
       const bodyParts: Buffer[] = [];
       if (upstream.body) {
@@ -4286,6 +4468,24 @@ async function proxyRequest(
       }
 
       let responseBody = Buffer.concat(bodyParts);
+
+      // Strip thinking tokens from non-streaming responses (same as streaming path)
+      if (responseBody.length > 0) {
+        try {
+          const parsed = JSON.parse(responseBody.toString()) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+          if (parsed.choices?.[0]?.message?.content) {
+            const stripped = stripThinkingTokens(parsed.choices[0].message.content);
+            if (stripped !== parsed.choices[0].message.content) {
+              parsed.choices[0].message.content = stripped;
+              responseBody = Buffer.from(JSON.stringify(parsed));
+            }
+          }
+        } catch {
+          /* not JSON, skip */
+        }
+      }
 
       // Prepend balance fallback notice to response content
       if (balanceFallbackNotice && responseBody.length > 0) {
@@ -4319,6 +4519,19 @@ async function proxyRequest(
           /* not JSON, skip notice */
         }
         budgetDowngradeNotice = undefined;
+      }
+
+      // Inject actualModelUsed into non-streaming response model field
+      if (actualModelUsed && responseBody.length > 0) {
+        try {
+          const parsed = JSON.parse(responseBody.toString()) as { model?: string };
+          if (parsed.model !== undefined) {
+            parsed.model = actualModelUsed;
+            responseBody = Buffer.from(JSON.stringify(parsed));
+          }
+        } catch {
+          /* not JSON, skip model injection */
+        }
       }
 
       // B: Add budget downgrade headers for orchestration layers
@@ -4419,31 +4632,57 @@ async function proxyRequest(
   }
 
   // --- Usage logging (fire-and-forget) ---
-  // Note: Use actual token counts from API response when available,
-  // fall back to estimates. Log actual cost without 20% buffer (the buffer
-  // is only needed for pre-payment estimation in estimateAmount()).
-  // Log ALL requests: both auto-routed (routingDecision set) and direct model picks
+  // Use actual x402 payment amount from the per-request AsyncLocalStorage store.
+  // This is the real amount the user paid — no estimation needed.
+  // Falls back to local estimate only for free models (no x402 payment).
   const logModel = routingDecision?.model ?? modelId;
   if (logModel) {
-    // Use actual token counts when available, fall back to estimates
-    const actualInputTokens = responseInputTokens ?? Math.ceil(body.length / 4);
-    const actualOutputTokens = responseOutputTokens ?? maxTokens;
+    const actualPayment = paymentStore.getStore()?.amountUsd ?? 0;
 
-    const accurateCosts = calculateModelCost(
-      logModel,
-      routerOpts.modelPricing,
-      actualInputTokens,
-      actualOutputTokens,
-      routingProfile ?? undefined,
-    );
+    // For free models (no x402 payment), use local cost calculation as fallback
+    let logCost: number;
+    let logBaseline: number;
+    let logSavings: number;
+    if (actualPayment > 0) {
+      logCost = actualPayment;
+      // Calculate baseline for savings comparison
+      const chargedInputTokens = Math.ceil(body.length / 4);
+      const modelDef = BLOCKRUN_MODELS.find((m) => m.id === logModel);
+      const chargedOutputTokens = modelDef ? Math.min(maxTokens, modelDef.maxOutput) : maxTokens;
+      const baseline = calculateModelCost(
+        logModel,
+        routerOpts.modelPricing,
+        chargedInputTokens,
+        chargedOutputTokens,
+        routingProfile ?? undefined,
+      );
+      logBaseline = baseline.baselineCost;
+      logSavings = logBaseline > 0 ? Math.max(0, (logBaseline - logCost) / logBaseline) : 0;
+    } else {
+      const chargedInputTokens = Math.ceil(body.length / 4);
+      const costs = calculateModelCost(
+        logModel,
+        routerOpts.modelPricing,
+        chargedInputTokens,
+        maxTokens,
+        routingProfile ?? undefined,
+      );
+      // Free models: actual cost is $0 (no x402 payment ever made).
+      // MIN_PAYMENT_USD floor in calculateModelCost would falsely inflate stats.
+      logCost = FREE_MODELS.has(logModel) ? 0 : costs.costEstimate;
+      logBaseline = costs.baselineCost;
+      logSavings = FREE_MODELS.has(logModel) ? 1 : costs.savings;
+    }
+
     const entry: UsageEntry = {
       timestamp: new Date().toISOString(),
       model: logModel,
       tier: routingDecision?.tier ?? "DIRECT",
-      cost: accurateCosts.costEstimate,
-      baselineCost: accurateCosts.baselineCost,
-      savings: accurateCosts.savings,
+      cost: logCost,
+      baselineCost: logBaseline,
+      savings: logSavings,
       latencyMs: Date.now() - startTime,
+      status: requestHadError ? "error" : "success",
       ...(responseInputTokens !== undefined && { inputTokens: responseInputTokens }),
       ...(responseOutputTokens !== undefined && { outputTokens: responseOutputTokens }),
     };
